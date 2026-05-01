@@ -11,6 +11,11 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 )
 
+// TestGrep_FindsMatches verifies the default output_mode (files_with_matches):
+// result contains the file path of any file containing the pattern, NOT the
+// matching line text. This is the cost-saving default — call sites that need
+// content must opt in via output_mode=content (covered by
+// TestGrep_FindsMatches_ContentMode).
 func TestGrep_FindsMatches(t *testing.T) {
 	tmp := t.TempDir()
 	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello world\n"), 0o644); err != nil {
@@ -24,8 +29,73 @@ func TestGrep_FindsMatches(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("unexpected error result: %s", result.Content)
 	}
+	if !strings.Contains(result.Content, "a.txt") {
+		t.Errorf("expected file path 'a.txt' in result, got: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "hello world") {
+		t.Errorf("default mode must NOT include match content; got: %s", result.Content)
+	}
+}
+
+// TestGrep_FindsMatches_ContentMode is the explicit opt-in for the old
+// behavior — file:line:text with match content. Required to keep grep
+// useful for "what does the matching line say" use cases.
+func TestGrep_FindsMatches_ContentMode(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := &GrepTool{}
+	result, err := tool.Run(context.Background(),
+		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"content"}`, tmp))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
 	if !strings.Contains(result.Content, "hello world") {
-		t.Errorf("expected match line, got: %s", result.Content)
+		t.Errorf("content mode must include matching line text; got: %s", result.Content)
+	}
+}
+
+// TestGrep_CountMode returns per-file match counts in path:N form.
+func TestGrep_CountMode(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello\nhello\nhello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := &GrepTool{}
+	result, err := tool.Run(context.Background(),
+		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"count"}`, tmp))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "a.txt:3") {
+		t.Errorf("count mode must include 'a.txt:3' (3 matches in 1 file); got: %s", result.Content)
+	}
+}
+
+// TestGrep_InvalidMode rejects unknown output_mode values.
+func TestGrep_InvalidMode(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := &GrepTool{}
+	result, err := tool.Run(context.Background(),
+		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"json"}`, tmp))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error for invalid output_mode, got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "output_mode") {
+		t.Errorf("error must reference output_mode, got: %s", result.Content)
 	}
 }
 
@@ -65,8 +135,11 @@ func TestGrep_GlobalLineCap(t *testing.T) {
 	}
 
 	tool := &GrepTool{}
+	// Explicit content mode — the cap-on-match-lines semantics this test
+	// targets only applies in content mode. Default files_with_matches
+	// would return ≤50 paths and never exercise per-line cap.
 	result, err := tool.Run(context.Background(),
-		fmt.Sprintf(`{"pattern":"needle","path":%q,"max_results":20}`, tmp))
+		fmt.Sprintf(`{"pattern":"needle","path":%q,"max_results":20,"output_mode":"content"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -123,8 +196,10 @@ func TestGrep_RelativePathWorksWithSessionCWD(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("unexpected error result: %s", result.Content)
 	}
-	if !strings.Contains(result.Content, "findme") {
-		t.Errorf("expected match, got: %s", result.Content)
+	// Default output_mode=files_with_matches returns the file path, not the
+	// matching line. Assert the path appears.
+	if !strings.Contains(result.Content, "a.txt") {
+		t.Errorf("expected file path 'a.txt' in result, got: %s", result.Content)
 	}
 }
 

@@ -27,20 +27,26 @@ type grepArgs struct {
 	Pattern    string `json:"pattern"`
 	Path       string `json:"path,omitempty"`
 	Glob       string `json:"glob,omitempty"`
+	OutputMode string `json:"output_mode,omitempty"` // "files_with_matches" (default), "content", "count"
 	MaxResults int    `json:"max_results,omitempty"`
 }
 
 func (t *GrepTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "grep",
-		Description: "Search file CONTENTS using a regex pattern. Returns matching lines with filenames and line numbers. Use glob to find files by name pattern instead.",
+		Description: "Search file CONTENTS using a regex pattern. By default returns matching FILE PATHS only (output_mode=files_with_matches) — keeps results small. Set output_mode=content to get matching lines as file:line:text, or output_mode=count for per-file match counts. Use glob to filter files by name pattern.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"pattern":     map[string]any{"type": "string", "description": "Regex pattern to search"},
-				"path":        map[string]any{"type": "string", "description": "Directory or file to search. Required when no session working directory is set."},
-				"glob":        map[string]any{"type": "string", "description": "File glob filter (e.g. '*.csv', '*.txt', '*.go')"},
-				"max_results": map[string]any{"type": "integer", "description": fmt.Sprintf("Global cap on total match lines returned (default: %d)", defaultGrepMaxResults)},
+				"pattern": map[string]any{"type": "string", "description": "Regex pattern to search"},
+				"path":    map[string]any{"type": "string", "description": "Directory or file to search. Required when no session working directory is set."},
+				"glob":    map[string]any{"type": "string", "description": "File glob filter (e.g. '*.csv', '*.txt', '*.go'). Only honored with rg; ignored on grep fallback."},
+				"output_mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"files_with_matches", "content", "count"},
+					"description": "files_with_matches (default): paths only. content: file:line:text — use when you need to read match context. count: per-file match counts.",
+				},
+				"max_results": map[string]any{"type": "integer", "description": fmt.Sprintf("Global cap on output lines (default: %d). In files_with_matches mode caps file paths; in content mode caps match lines; in count mode caps file:count entries.", defaultGrepMaxResults)},
 			},
 		},
 		Required: []string{"pattern"},
@@ -68,6 +74,14 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	}
 	path = resolved
 
+	mode := args.OutputMode
+	if mode == "" {
+		mode = "files_with_matches"
+	}
+	if mode != "files_with_matches" && mode != "content" && mode != "count" {
+		return agent.ValidationError(fmt.Sprintf("invalid output_mode %q: must be 'files_with_matches', 'content', or 'count'", mode)), nil
+	}
+
 	maxResults := args.MaxResults
 	if maxResults <= 0 {
 		maxResults = defaultGrepMaxResults
@@ -79,26 +93,41 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	runCtx, cancel := context.WithTimeout(ctx, grepTimeout)
 	defer cancel()
 
-	// Keep rg's per-file --max-count low so a single massive file doesn't
-	// balloon the output buffer. The real global cap is applied during
-	// output parsing below.
-	cmdArgs := []string{
-		"-n",
-		"--max-count", fmt.Sprintf("%d", grepPerFileMaxCount),
-	}
-	if args.Glob != "" {
-		cmdArgs = append(cmdArgs, "--glob", args.Glob)
-	}
-	cmdArgs = append(cmdArgs, args.Pattern, path)
-
+	// Pick binary first so per-mode flags can branch on it. grep fallback
+	// loses --glob support (GNU/BSD grep don't accept it); document this in
+	// the schema rather than emulate via --include.
 	bin := "rg"
 	if _, err := exec.LookPath("rg"); err != nil {
 		bin = "grep"
-		// -m caps matches per file; without it a pathological input could
-		// have CombinedOutput() buffer tens of MB before the scanner cap
-		// kicks in below. Both GNU and BSD grep accept -m.
-		cmdArgs = []string{"-rn", "-I", "-m", fmt.Sprintf("%d", grepPerFileMaxCount), args.Pattern, path}
 	}
+
+	// Per-mode cmd args. Per-file --max-count caps massive single files
+	// before the global line cap below; only relevant in content mode.
+	var cmdArgs []string
+	switch mode {
+	case "files_with_matches":
+		if bin == "rg" {
+			cmdArgs = []string{"-l"}
+		} else {
+			cmdArgs = []string{"-rl", "-I"}
+		}
+	case "content":
+		if bin == "rg" {
+			cmdArgs = []string{"-n", "--max-count", fmt.Sprintf("%d", grepPerFileMaxCount)}
+		} else {
+			cmdArgs = []string{"-rn", "-I", "-m", fmt.Sprintf("%d", grepPerFileMaxCount)}
+		}
+	case "count":
+		if bin == "rg" {
+			cmdArgs = []string{"-c"}
+		} else {
+			cmdArgs = []string{"-rc", "-I"}
+		}
+	}
+	if args.Glob != "" && bin == "rg" {
+		cmdArgs = append(cmdArgs, "--glob", args.Glob)
+	}
+	cmdArgs = append(cmdArgs, args.Pattern, path)
 
 	cmd := exec.CommandContext(runCtx, bin, cmdArgs...)
 	output, cmdErr := cmd.CombinedOutput()
@@ -162,7 +191,14 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 
 	content := strings.Join(capped, "\n")
 	if truncated {
-		content += fmt.Sprintf("\n[results truncated at %d of %d matches; narrow the search with a more specific pattern or path]", maxResults, total)
+		unit := "matches"
+		switch mode {
+		case "files_with_matches":
+			unit = "files"
+		case "count":
+			unit = "files"
+		}
+		content += fmt.Sprintf("\n[results truncated at %d of %d %s; narrow the search with a more specific pattern or path]", maxResults, total, unit)
 	}
 
 	return agent.ToolResult{Content: content}, nil
