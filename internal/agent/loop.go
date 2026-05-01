@@ -2594,6 +2594,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			batches := partitionToolCalls(approved)
 			a.tracker.Enter(PhaseExecutingTools)
 			executeBatches(ctx, batches, execResults, readTracker, a.handler)
+			// Per-turn aggregate cap: even when each result is below the 50K
+			// per-result spillThreshold, parallel of N tools returning
+			// 30K each can put hundreds of KB into one user message. Spill
+			// the largest result(s) to bring the sum under 200K. No-op for
+			// turns with small or few results.
+			applyAggregateCap(execResults, a.shannonDir, a.sessionID)
 			a.tracker.MarkDirty() // tool batch is durable state for checkpoint
 			// Fire mid-turn checkpoint after captureRunMessages below, so
 			// RunMessages() reflects the just-completed batch. The actual

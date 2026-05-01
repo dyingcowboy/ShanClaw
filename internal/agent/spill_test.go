@@ -164,3 +164,115 @@ func TestSpillThresholdIntegration(t *testing.T) {
 		t.Fatal("threshold constant mismatch")
 	}
 }
+
+// TestApplyAggregateCap_NoOpUnderCap: when total content is under the cap,
+// applyAggregateCap leaves execResults untouched.
+func TestApplyAggregateCap_NoOpUnderCap(t *testing.T) {
+	dir := t.TempDir()
+	results := []toolExecResult{
+		{result: ToolResult{Content: strings.Repeat("a", 30_000)}},
+		{result: ToolResult{Content: strings.Repeat("b", 30_000)}},
+		{result: ToolResult{Content: strings.Repeat("c", 30_000)}},
+	}
+	// total = 90K < 200K cap
+	applyAggregateCap(results, dir, "test-sess")
+	for i, er := range results {
+		if len(er.result.Content) != 30_000 {
+			t.Errorf("result[%d] should be untouched (30K), got %d bytes", i, len(er.result.Content))
+		}
+	}
+}
+
+// TestApplyAggregateCap_NoOpForSmallBatch: even if total > cap, single-element
+// batches are no-ops (the per-result spillThreshold path handles them).
+func TestApplyAggregateCap_NoOpForSmallBatch(t *testing.T) {
+	dir := t.TempDir()
+	results := []toolExecResult{
+		{result: ToolResult{Content: strings.Repeat("a", 300_000)}},
+	}
+	applyAggregateCap(results, dir, "test-sess")
+	if len(results[0].result.Content) != 300_000 {
+		t.Errorf("single-element batch should be no-op, got %d bytes", len(results[0].result.Content))
+	}
+}
+
+// TestApplyAggregateCap_TenBy30K: 10×30K = 300K, none individually past
+// per-result spillThreshold. Aggregate cap must spill enough of the
+// largest results to bring total below 200K.
+func TestApplyAggregateCap_TenBy30K(t *testing.T) {
+	dir := t.TempDir()
+	results := make([]toolExecResult, 10)
+	for i := range results {
+		results[i] = toolExecResult{result: ToolResult{Content: strings.Repeat("x", 30_000)}}
+	}
+	applyAggregateCap(results, dir, "test-sess-tenby30k")
+	total := 0
+	spilled := 0
+	for _, er := range results {
+		total += len(er.result.Content)
+		if strings.HasPrefix(er.result.Content, "[Output saved to disk:") {
+			spilled++
+		}
+	}
+	if total > aggregateCapThreshold {
+		t.Errorf("total after cap (%d) still exceeds threshold (%d)", total, aggregateCapThreshold)
+	}
+	if spilled == 0 {
+		t.Error("expected at least one spill, got none")
+	}
+	t.Logf("after cap: total=%d, spilled=%d / 10", total, spilled)
+}
+
+// TestApplyAggregateCap_MixedSizes: largest results get spilled first; small
+// results below minAggregateSpillSize are protected from spill (the preview
+// header would defeat the savings).
+func TestApplyAggregateCap_MixedSizes(t *testing.T) {
+	dir := t.TempDir()
+	results := []toolExecResult{
+		{result: ToolResult{Content: strings.Repeat("a", 80_000)}}, // largest
+		{result: ToolResult{Content: strings.Repeat("b", 80_000)}},
+		{result: ToolResult{Content: strings.Repeat("c", 80_000)}},
+		{result: ToolResult{Content: strings.Repeat("d", 1_000)}},  // small, must not spill
+	}
+	// total = 241K > 200K
+	applyAggregateCap(results, dir, "test-sess-mixed")
+	// First three are eligible (>= minAggregateSpillSize), should be spilled in
+	// some order until total < 200K. The 1K one must remain literal.
+	if len(results[3].result.Content) != 1_000 {
+		t.Errorf("small result should not be spilled, got %d bytes (content: %.50s)", len(results[3].result.Content), results[3].result.Content)
+	}
+	total := 0
+	for _, er := range results {
+		total += len(er.result.Content)
+	}
+	if total > aggregateCapThreshold {
+		t.Errorf("total after cap (%d) still exceeds threshold (%d)", total, aggregateCapThreshold)
+	}
+}
+
+// TestApplyAggregateCap_CooperatesWithPerResultSpill: a result that already
+// exceeds the per-result spillThreshold (50K) is naturally the "largest"
+// candidate and gets spilled first. This documents the intended interaction
+// — per-result spill (in loop.go) and aggregate cap don't conflict.
+func TestApplyAggregateCap_CooperatesWithPerResultSpill(t *testing.T) {
+	dir := t.TempDir()
+	results := []toolExecResult{
+		{result: ToolResult{Content: strings.Repeat("a", 100_000)}}, // > 50K per-result threshold
+		{result: ToolResult{Content: strings.Repeat("b", 60_000)}},
+		{result: ToolResult{Content: strings.Repeat("c", 60_000)}},
+	}
+	// total = 220K > 200K. Aggregate cap kicks in (per-result spill happens
+	// elsewhere in loop.go; this test only exercises the aggregate path).
+	applyAggregateCap(results, dir, "test-sess-coop")
+	total := 0
+	for _, er := range results {
+		total += len(er.result.Content)
+	}
+	if total > aggregateCapThreshold {
+		t.Errorf("total after cap (%d) still exceeds threshold (%d)", total, aggregateCapThreshold)
+	}
+	// The 100K one should be the first picked.
+	if !strings.HasPrefix(results[0].result.Content, "[Output saved to disk:") {
+		t.Errorf("largest (100K) result should be spilled first, but content[0] is: %.80s", results[0].result.Content)
+	}
+}

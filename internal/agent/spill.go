@@ -13,6 +13,17 @@ const (
 	spillThreshold = 50000
 	// spillPreviewChars is the number of leading runes kept as an in-context preview.
 	spillPreviewChars = 2000
+	// aggregateCapThreshold is the per-turn cap on the SUM of all tool result
+	// content lengths. Even when no single result triggers spillThreshold,
+	// 10 parallel tools returning 30K each puts 300K into one user message —
+	// uncapped cache_creation pressure. Mirrors CC's
+	// MAX_TOOL_RESULTS_PER_MESSAGE_CHARS at
+	// claude-code-source/src/constants/toolLimits.ts:49.
+	aggregateCapThreshold = 200_000
+	// minAggregateSpillSize: don't spill anything smaller than this when
+	// reducing the aggregate — at small sizes the spill preview header
+	// (~150B) is a meaningful fraction of the savings.
+	minAggregateSpillSize = 5_000
 )
 
 // spillToDisk writes content to a temp file under ~/.shannon/tmp/ and returns
@@ -48,6 +59,54 @@ func spillToDisk(shannonDir, sessionID, callID, content string) (preview string,
 	preview = fmt.Sprintf("[Output saved to disk: %s (%s chars)]\n\nPreview (first %d chars):\n%s",
 		path, strconv.Itoa(len(runes)), len(previewRunes), string(previewRunes))
 	return preview, nil
+}
+
+// applyAggregateCap enforces the per-turn aggregate char-count cap on a
+// batch's tool results. When the SUM of all execResults[*].result.Content
+// lengths exceeds aggregateCapThreshold, the largest spill-eligible result
+// is written to disk and replaced with a short preview, repeating until the
+// total is under the cap or nothing remains worth spilling.
+//
+// The per-result spillThreshold (50K) and this aggregate cap (200K) are
+// independent: a single 60K result is already spilled by the per-result
+// path, but 10×30K results — each below 50K — are only caught here.
+//
+// Mutates execResults in place. Safe for any execResults length; no-op for
+// empty/single-element batches. spillToDisk failures are silently ignored
+// so a transient disk error doesn't stall the agent loop — worst case is
+// the message goes through uncapped.
+func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID string) {
+	if len(execResults) < 2 {
+		return
+	}
+	total := 0
+	for i := range execResults {
+		total += len(execResults[i].result.Content)
+	}
+	if total <= aggregateCapThreshold {
+		return
+	}
+	for total > aggregateCapThreshold {
+		maxIdx := -1
+		maxLen := 0
+		for i := range execResults {
+			n := len(execResults[i].result.Content)
+			if n >= minAggregateSpillSize && n > maxLen {
+				maxIdx = i
+				maxLen = n
+			}
+		}
+		if maxIdx == -1 {
+			return // nothing left worth spilling
+		}
+		original := execResults[maxIdx].result.Content
+		spilled, err := spillToDisk(shannonDir, sessionID, generateCallID(), original)
+		if err != nil {
+			return
+		}
+		execResults[maxIdx].result.Content = spilled
+		total = total - len(original) + len(spilled)
+	}
 }
 
 // cleanupSpills removes all spill files for a given session ID.
