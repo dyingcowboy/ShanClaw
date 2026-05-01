@@ -20,7 +20,7 @@ type thinkArgs struct {
 func (t *ThinkTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "think",
-		Description: "Use this to plan or reason through complex multi-step tasks before acting. Always use this instead of outputting plans as plain text.",
+		Description: "Use this tool to think about something. It will not obtain new information or change any state — it just appends the thought to the log. Use it when complex reasoning or sequential decisions are needed (long tool chains, policy-heavy tasks). For simpler reasoning extended thinking handles it natively.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -39,7 +39,13 @@ func (t *ThinkTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult,
 	if args.Thought == "" {
 		return agent.ToolResult{Content: "thought is required", IsError: true}, nil
 	}
-	return agent.ToolResult{Content: args.Thought}, nil
+	// Short ack instead of echoing the thought back. The thought already
+	// lives in the assistant message's tool_use.input.thought field — the
+	// model can reference its own past reasoning from there. Echoing into
+	// the tool_result was double-counting the thought against cache
+	// (assistant tool_use input + user tool_result content). Cuts ~50% of
+	// think-related cache writes per session.
+	return agent.ToolResult{Content: "thought logged"}, nil
 }
 
 func (t *ThinkTool) RequiresApproval() bool { return false }

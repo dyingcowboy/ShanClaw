@@ -219,7 +219,7 @@ IMPORTANT: Do NOT use bash to run find, grep, cat, head, tail, sed, awk, or ls c
 - NEVER fabricate web page content. If browser_* tools returned empty content, an anti-bot warning, or errors, report the failure honestly to the user. Do NOT invent product listings, prices, reviews, or any data that was not present in the actual tool result. State clearly: "I was unable to access/extract data from [site] because [reason]."
 
 ### Planning
-- think: Use this to plan or reason through complex multi-step tasks before acting. Always use this instead of outputting plans as plain text.
+- think: Append a structured thought to the log when complex reasoning or sequential decisions are needed (long tool chains, policy-heavy tasks). Does not obtain new information or change state. For simpler reasoning extended thinking handles it natively — don't reach for this tool by default.
 
 ### System
 - system_info: OS/hardware information.
