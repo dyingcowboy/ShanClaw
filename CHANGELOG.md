@@ -2,6 +2,52 @@
 
 All notable changes to ShanClaw are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.1.3 — 2026-05-08 — Cross-repo coordination + publish_to_web
+
+Bundles two cross-repo tracks and one major new tool. The WS handshake + `delivery_ack` capability close the loop with Shannon Cloud's Phase 4 inbound queue / replay buffer (Cloud-side ships in parallel, gates on the capability so old daemons stay on legacy fire-and-forget). The new **publish_to_web** tool (#116) ships permanent-public-URL file upload with multi-layer guards and a framework-level per-call approval gate. 429 sub-codes are now properly disambiguated so quota / credits-exhausted users see actionable messages instead of the generic "try again in a moment". Plus the **agent preamble** feature (#115) that gives Slack / Feishu / Desktop users live "about to run X" narration between tool calls.
+
+### Added
+
+- **`publish_to_web` tool** (#116) — uploads a file to Shannon Cloud's `POST /api/v1/uploads` and returns a permanent, public URL. Activated when `cloud.enabled: true` AND `api_key` is configured. Defense-in-depth: required `purpose` arg surfaced in approval UI; path-segment blocklist (`.env`/`.ssh`/`credentials`/`id_rsa`/...) on user-supplied AND symlink-resolved path; basename suffix blocklist (`.pem`/`.key`/`.p12`/`.pfx`/`.jks`/`.keystore`/`.asc`/`.gpg`) including disguised double-extensions like `*.key.txt`; extension allowlist (html/md/txt/pdf/png/jpg/svg/csv/json/mp4/... by default, extensible via `cloud.publish_allowed_extensions`); 50 MiB pre-check; multipart streaming via `io.Pipe`; 3-attempt retry with 1s/2s/4s backoff.
+- **`agent.SkillExempt` framework interface** (#116) — pure-infrastructure tools (`think`, `tool_search`, `use_skill`) opt out of skill `allowed-tools` enforcement. An inventory test pins the allow/deny set across 22 production tools (file / shell / network / macOS-GUI / schedule / cloud / MCP wrappers); copy-pasting `SkillExempt() bool { return true }` onto a side-effecting tool is now a test failure.
+- **`agent.DisallowsAutoApproval` framework helper** — names tools requiring a fresh human decision per call. Wired into every previously-blanket-returns-true approval gate: scheduler, heartbeat TranscriptCollector, daemon `auto_approve` config, daemon WS handler, CLI `--yes`, TUI session-allow + always-allow, HTTP one-shot, SSE handler. Per-call tools also reject session-level "always-allow" persistence; users see a one-shot notice via `EventApprovalNotice`. Currently lists `publish_to_web`.
+- **WS upgrade handshake** (`User-Agent`, `X-ShanClaw-Daemon-Version`, `X-ShanClaw-Capabilities`) — daemon advertises version + capability tokens on every connect so Shannon Cloud can gate optional protocol features per-connection. Empty / absent header = legacy mode (forward-compat with older daemons).
+- **`delivery_ack` capability + emission** — daemon sends a `MsgTypeDeliveryAck` envelope (top-level `MessageID`, no payload) after every successful `SendReply`. Cloud's 5-min replay buffer drops the entry on ack; un-acked messages (crash, network drop pre-reply, ctx cancel) are replayed on reconnect. Capability advertised by default.
+- **Sender-suffix routing for messaging platforms without thread** — `ComputeRouteKey` now appends `<sender>` for messaging-source + no-ThreadID + Sender-present. New shapes: `default:<source>:<channel>:<sender>` and `agent:<name>:<source>:<channel>:<sender>`. Backward-compat: empty Sender keeps the legacy `default:<source>:<channel>`. Fixes WeCom group multi-user collisions (WeCom has no thread concept).
+- **Agent preamble** (#115) — agents narrate "about to run X" between tool calls. New `OnPreamble(text)` callback split off from `OnText`; daemon emits `agent_text` SSE event; TUI renders preamble in dim style; system prompt rebalanced to permit brief narration without flooding prose.
+- **`CodeQuotaExceeded` + `CodeCreditsExhausted` run-status codes** (`internal/runstatus`) — replace the everything-is-`CodeRateLimited` collapse for HTTP 429 responses.
+- **`runstatus.FriendlyMessageFromError` with templated rendering** — substitutes `reset_at` + `window` into the quota message; renders the auto-refill variant for credits. Stable prefixes preserved so `IsFriendlyMessage` (and thus context-shaping drop logic) recognizes templated forms.
+- **`cloud.publish_allowed_extensions` overlay merge** — project + local config can extend the default extension allowlist for publish; endpoint, API key, enablement, and timeout remain process-scoped.
+
+### Fixed
+
+- **429 sub-code disambiguation** (`internal/runstatus/parse.go`) — was substring-matching `"429"` and collapsing four very different gateway responses (token quota exceeded, credits exhausted, per-window throttle, upstream Anthropic throttle) onto `CodeRateLimited`. Quota-locked and credits-exhausted users were getting the actively misleading "please try again in a moment" — the cap was locked until the next reset, retrying did nothing. Now uses `errors.As(*client.APIError)` first, parses the JSON body, routes by `error` field shape (object = upstream; string = switch on value). Plain string-wrapping (no `%w`) loses the type and falls back to the coarse `CodeRateLimited`, documented in tests.
+- **`multiHandler.OnPreamble` fan-out test gap** — `TestMultiHandlerFansOutBaseMethods` declared a preamble counter but never invoked / asserted it. If the fan-out were ever silently no-op'd, every daemon channel (Slack / Feishu / Desktop bus) would drop preamble events with no test failure. Added the missing invocation + assertion.
+- **TUI session-level "always-allow" now respects `DisallowsAutoApproval`** — closes a path where prior approvals on other tools could re-grant the per-call gate.
+- **Sensitive-name guards catch disguised double extensions** — `id_rsa.key.txt`, `server.key.txt`, `credentials.json`, `.env.local.txt` now rejected via the suffix-anywhere check + reused `permissions.IsSensitiveFile` patterns.
+
+### Changed
+
+- **`runstatus.CodeFromError`** now prefers `errors.As(*client.APIError)` for structured extraction; substring-matching is the fallback for errors without the type wrapper.
+- **`runstatus.IsFriendlyMessage`** extended with `HasPrefix` matching so templated quota / credits messages are recognized as friendly errors and dropped during context shaping.
+- **Default `daemon.Capabilities`** is now `["delivery_ack"]`. Old daemons stay legacy; new daemons activate Phase 4 tracking automatically when Cloud's side ships.
+- **`vaguePurposes` blocklist now reachable** — vagueness check moved before length check; whitespace normalization added; longer phrases (`"for testing"`, `"share with team"`, `"send to user"`, etc.) added so realistic LLM fallback purposes are caught.
+
+### Docs
+
+- CLAUDE.md / AGENTS.md updated for: WS handshake & capabilities, `delivery_ack` contract, sender-suffix route-key precedence ladder, `runstatus/parse.go` file purpose.
+- Kocoro skill `references/agents.md` Reset note now mentions clearing the persisted route binding.
+
+### Cross-repo consumers
+
+- **Shannon Cloud**: capability handshake is the prerequisite for Phase 4 unacked-tracking + replay-on-reconnect. Cloud-side gates on `"delivery_ack" in conn.capabilities`; old daemons → no tracking → legacy fire-and-forget. The 429 body schemas Cloud emits (per `middleware/quota.go`, `middleware/ratelimit.go`, `openai/handler.go`) are now parsed properly on the daemon side.
+- **ShanClaw Desktop**: helper bundle should rebuild against this tag's SHA to pick up the daemon changes. Templated quota / credits messages currently render as the static fallback in the TUI — full templating needs `RunStatus` to carry `*runstatus.Detail`, deferred to a follow-up.
+- **npm `@kocoro/shanclaw`**: release CI publishes against this tag.
+
+### Versioning note
+
+Patch bump in the v0.1.x line. `publish_to_web` is additive (cloud-gated), the `SkillExempt` + `DisallowsAutoApproval` framework is BC, and the WS handshake is forward-compat. No breaking runtime contracts.
+
 ## v0.1.2 — 2026-05-07 — Tool-layer cost optimization + release-blocker fixes
 
 Bundles PR #114 (tool-layer cost optimization), PR #113 (webhook agent isolation), the daemon WS approval-message fix, and the five release-blocker fixes that came out of the cross-branch code review.
