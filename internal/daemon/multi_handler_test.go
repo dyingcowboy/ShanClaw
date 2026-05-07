@@ -52,6 +52,7 @@ func TestMultiHandlerFansOutBaseMethods(t *testing.T) {
 	m.OnToolCall("bash", "ls")
 	m.OnToolResult("bash", "ls", agent.ToolResult{}, 0)
 	m.OnText("hi")
+	m.OnPreamble("about to run ls")
 	m.OnStreamDelta("d")
 	m.OnUsage(agent.TurnUsage{})
 	m.OnCloudAgent("id", "running", "msg")
@@ -59,7 +60,7 @@ func TestMultiHandlerFansOutBaseMethods(t *testing.T) {
 	m.OnCloudPlan("research", "content", false)
 
 	for _, s := range []*usageSpy{a, b} {
-		if s.toolCalls != 1 || s.toolResults != 1 || s.text != 1 || s.streamDelta != 1 ||
+		if s.toolCalls != 1 || s.toolResults != 1 || s.text != 1 || s.preamble != 1 || s.streamDelta != 1 ||
 			s.usage != 1 || s.cloudAgent != 1 || s.cloudProgress != 1 || s.cloudPlan != 1 {
 			t.Fatalf("spy counts off: %+v", s.spyHandler)
 		}
