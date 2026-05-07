@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,26 +25,51 @@ const (
 	grepTimeout           = 30 * time.Second
 )
 
+var grepVCSDirs = []string{".git", ".svn", ".hg", ".bzr", ".jj", ".sl"}
+
 type GrepTool struct{}
 
 type grepArgs struct {
-	Pattern    string `json:"pattern"`
-	Path       string `json:"path,omitempty"`
-	Glob       string `json:"glob,omitempty"`
-	MaxResults int    `json:"max_results,omitempty"`
+	Pattern       string `json:"pattern"`
+	Path          string `json:"path,omitempty"`
+	Glob          string `json:"glob,omitempty"`
+	OutputMode    string `json:"output_mode,omitempty"` // "files_with_matches" (default), "content", "count"
+	MaxResults    int    `json:"max_results,omitempty"`
+	Type          string `json:"type,omitempty"`
+	HeadLimit     int    `json:"head_limit,omitempty"`
+	Offset        int    `json:"offset,omitempty"`
+	Context       int    `json:"context,omitempty"`
+	BeforeContext int    `json:"before_context,omitempty"`
+	AfterContext  int    `json:"after_context,omitempty"`
+	IgnoreCase    bool   `json:"ignore_case,omitempty"`
+	Multiline     bool   `json:"multiline,omitempty"`
 }
 
 func (t *GrepTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "grep",
-		Description: "Search file CONTENTS using a regex pattern. Returns matching lines with filenames and line numbers. Use glob to find files by name pattern instead.",
+		Name:               "grep",
+		MaxResultSizeChars: 20000,
+		Description:        "Search file CONTENTS using a regex pattern. By default returns matching FILE PATHS only (output_mode=files_with_matches) — keeps results small. Set output_mode=content to get matching lines as file:line:text, or output_mode=count for per-file match counts. Use glob to filter files by name pattern.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"pattern":     map[string]any{"type": "string", "description": "Regex pattern to search"},
-				"path":        map[string]any{"type": "string", "description": "Directory or file to search. Required when no session working directory is set."},
-				"glob":        map[string]any{"type": "string", "description": "File glob filter (e.g. '*.csv', '*.txt', '*.go')"},
-				"max_results": map[string]any{"type": "integer", "description": fmt.Sprintf("Global cap on total match lines returned (default: %d)", defaultGrepMaxResults)},
+				"pattern": map[string]any{"type": "string", "description": "Regex pattern to search"},
+				"path":    map[string]any{"type": "string", "description": "Directory or file to search. Required when no session working directory is set."},
+				"glob":    map[string]any{"type": "string", "description": "File glob filter (e.g. '*.csv', '*.txt', '*.go'). Only honored with rg; ignored on grep fallback."},
+				"output_mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"files_with_matches", "content", "count"},
+					"description": "files_with_matches (default): paths only. content: file:line:text — use when you need to read match context. count: per-file match counts.",
+				},
+				"max_results":    map[string]any{"type": "integer", "description": fmt.Sprintf("Global cap on output lines (default: %d). In files_with_matches mode caps file paths; in content mode caps match lines; in count mode caps file:count entries.", defaultGrepMaxResults)},
+				"type":           map[string]any{"type": "string", "description": "ripgrep file type filter, e.g. go, js, ts, py. Requires rg."},
+				"head_limit":     map[string]any{"type": "integer", "description": "Return only this many output lines after offset."},
+				"offset":         map[string]any{"type": "integer", "description": "Skip this many output lines before returning results."},
+				"context":        map[string]any{"type": "integer", "description": "Include N lines before and after each content match."},
+				"before_context": map[string]any{"type": "integer", "description": "Include N lines before each content match."},
+				"after_context":  map[string]any{"type": "integer", "description": "Include N lines after each content match."},
+				"ignore_case":    map[string]any{"type": "boolean", "description": "Case-insensitive search."},
+				"multiline":      map[string]any{"type": "boolean", "description": "Allow multiline regex matching. Requires rg."},
 			},
 		},
 		Required: []string{"pattern"},
@@ -68,6 +97,14 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	}
 	path = resolved
 
+	mode := args.OutputMode
+	if mode == "" {
+		mode = "files_with_matches"
+	}
+	if mode != "files_with_matches" && mode != "content" && mode != "count" {
+		return agent.ValidationError(fmt.Sprintf("invalid output_mode %q: must be 'files_with_matches', 'content', or 'count'", mode)), nil
+	}
+
 	maxResults := args.MaxResults
 	if maxResults <= 0 {
 		maxResults = defaultGrepMaxResults
@@ -79,26 +116,74 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	runCtx, cancel := context.WithTimeout(ctx, grepTimeout)
 	defer cancel()
 
-	// Keep rg's per-file --max-count low so a single massive file doesn't
-	// balloon the output buffer. The real global cap is applied during
-	// output parsing below.
-	cmdArgs := []string{
-		"-n",
-		"--max-count", fmt.Sprintf("%d", grepPerFileMaxCount),
-	}
-	if args.Glob != "" {
-		cmdArgs = append(cmdArgs, "--glob", args.Glob)
-	}
-	cmdArgs = append(cmdArgs, args.Pattern, path)
-
+	// Pick binary first so per-mode flags can branch on it. grep fallback
+	// loses --glob support (GNU/BSD grep don't accept it); document this in
+	// the schema rather than emulate via --include.
 	bin := "rg"
 	if _, err := exec.LookPath("rg"); err != nil {
 		bin = "grep"
-		// -m caps matches per file; without it a pathological input could
-		// have CombinedOutput() buffer tens of MB before the scanner cap
-		// kicks in below. Both GNU and BSD grep accept -m.
-		cmdArgs = []string{"-rn", "-I", "-m", fmt.Sprintf("%d", grepPerFileMaxCount), args.Pattern, path}
 	}
+
+	// Per-mode cmd args. Per-file --max-count caps massive single files
+	// before the global line cap below; only relevant in content mode.
+	var cmdArgs []string
+	if bin == "rg" {
+		cmdArgs = append(cmdArgs, "--hidden")
+		for _, dir := range grepVCSDirs {
+			cmdArgs = append(cmdArgs, "--glob", "!"+dir, "--glob", "!"+dir+"/**", "--glob", "!**/"+dir+"/**")
+		}
+		// Prevent minified/base64 lines from dominating tool output.
+		cmdArgs = append(cmdArgs, "--max-columns", "500")
+	}
+	switch mode {
+	case "files_with_matches":
+		if bin == "rg" {
+			cmdArgs = append(cmdArgs, "-l")
+		} else {
+			cmdArgs = append(cmdArgs, "-rl", "-I")
+		}
+	case "content":
+		if bin == "rg" {
+			cmdArgs = append(cmdArgs, "-n", "--max-count", fmt.Sprintf("%d", grepPerFileMaxCount))
+		} else {
+			cmdArgs = append(cmdArgs, "-rn", "-I", "-m", fmt.Sprintf("%d", grepPerFileMaxCount))
+		}
+	case "count":
+		if bin == "rg" {
+			cmdArgs = append(cmdArgs, "-c")
+		} else {
+			cmdArgs = append(cmdArgs, "-rc", "-I")
+		}
+	}
+	if args.Glob != "" && bin == "rg" {
+		for _, pattern := range splitGrepGlobPatterns(args.Glob) {
+			cmdArgs = append(cmdArgs, "--glob", pattern)
+		}
+	}
+	if args.IgnoreCase {
+		cmdArgs = append(cmdArgs, "-i")
+	}
+	if args.Context > 0 {
+		cmdArgs = append(cmdArgs, "-C", strconv.Itoa(args.Context))
+	}
+	if args.BeforeContext > 0 {
+		cmdArgs = append(cmdArgs, "-B", strconv.Itoa(args.BeforeContext))
+	}
+	if args.AfterContext > 0 {
+		cmdArgs = append(cmdArgs, "-A", strconv.Itoa(args.AfterContext))
+	}
+	if args.Type != "" && bin == "rg" {
+		cmdArgs = append(cmdArgs, "--type", args.Type)
+	}
+	if args.Multiline && bin == "rg" {
+		cmdArgs = append(cmdArgs, "-U", "--multiline-dotall")
+	}
+	if bin == "rg" && strings.HasPrefix(args.Pattern, "-") {
+		cmdArgs = append(cmdArgs, "-e", args.Pattern)
+	} else {
+		cmdArgs = append(cmdArgs, args.Pattern)
+	}
+	cmdArgs = append(cmdArgs, path)
 
 	cmd := exec.CommandContext(runCtx, bin, cmdArgs...)
 	output, cmdErr := cmd.CombinedOutput()
@@ -136,36 +221,177 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	// defense against a search that matches thousands of files and would
 	// otherwise dump megabytes of lines into agent context.
 	var (
-		capped     []string
-		total      int
-		truncated  bool
 		scanner    = bufio.NewScanner(bytes.NewReader(output))
 		scanBuffer = make([]byte, 0, 64*1024)
 	)
 	scanner.Buffer(scanBuffer, 1024*1024) // handle long lines up to 1 MiB
+	var lines []string
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
 		}
-		total++
-		if total > maxResults {
-			truncated = true
-			continue
-		}
-		capped = append(capped, line)
+		lines = append(lines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return agent.ToolResult{Content: fmt.Sprintf("grep output scan error: %v", err), IsError: true}, nil
+	}
+	if len(lines) == 0 {
+		return agent.ToolResult{Content: "no matches found"}, nil
+	}
+	if mode == "files_with_matches" {
+		sortGrepFilesByMTime(lines, path)
 	}
 
-	if total == 0 {
-		return agent.ToolResult{Content: "no matches found"}, nil
+	offset := args.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	limit := maxResults
+	if args.HeadLimit > 0 && args.HeadLimit < limit {
+		limit = args.HeadLimit
+	}
+	capped, truncated := windowGrepLines(lines, offset, limit)
+	for i, line := range capped {
+		capped[i] = relativizeGrepOutputLine(ctx, path, mode, line)
 	}
 
 	content := strings.Join(capped, "\n")
 	if truncated {
-		content += fmt.Sprintf("\n[results truncated at %d of %d matches; narrow the search with a more specific pattern or path]", maxResults, total)
+		unit := "matches"
+		switch mode {
+		case "files_with_matches":
+			unit = "files"
+		case "count":
+			unit = "files"
+		}
+		content += fmt.Sprintf("\n[results truncated at %d of %d %s; narrow the search with a more specific pattern or path]", limit, len(lines), unit)
 	}
 
 	return agent.ToolResult{Content: content}, nil
+}
+
+func splitGrepGlobPatterns(glob string) []string {
+	var out []string
+	for _, raw := range strings.Fields(glob) {
+		if strings.Contains(raw, "{") && strings.Contains(raw, "}") {
+			out = append(out, raw)
+			continue
+		}
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
+func windowGrepLines(lines []string, offset, limit int) ([]string, bool) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(lines) {
+		return nil, false
+	}
+	start := offset
+	end := len(lines)
+	if limit > 0 && start+limit < end {
+		end = start + limit
+	}
+	return lines[start:end], end < len(lines)
+}
+
+func sortGrepFilesByMTime(lines []string, searchRoot string) {
+	type entry struct {
+		line  string
+		mtime time.Time
+	}
+	entries := make([]entry, len(lines))
+	for i, line := range lines {
+		path := line
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(searchRoot, path)
+		}
+		if info, err := os.Stat(path); err == nil {
+			entries[i] = entry{line: line, mtime: info.ModTime()}
+		} else {
+			entries[i] = entry{line: line}
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].mtime.Equal(entries[j].mtime) {
+			return entries[i].line < entries[j].line
+		}
+		return entries[i].mtime.After(entries[j].mtime)
+	})
+	for i := range entries {
+		lines[i] = entries[i].line
+	}
+}
+
+func relativizeGrepOutputLine(ctx context.Context, searchRoot, mode, line string) string {
+	switch mode {
+	case "files_with_matches":
+		return relativizeGrepPath(ctx, searchRoot, line)
+	case "content":
+		path, rest, ok := splitGrepContentLine(line)
+		if !ok {
+			return line
+		}
+		return relativizeGrepPath(ctx, searchRoot, path) + rest
+	case "count":
+		idx := strings.LastIndex(line, ":")
+		if idx <= 0 {
+			return line
+		}
+		return relativizeGrepPath(ctx, searchRoot, line[:idx]) + line[idx:]
+	default:
+		return line
+	}
+}
+
+func splitGrepContentLine(line string) (path, rest string, ok bool) {
+	for i := 0; i < len(line); i++ {
+		if line[i] != ':' && line[i] != '-' {
+			continue
+		}
+		j := i + 1
+		if j >= len(line) || line[j] < '0' || line[j] > '9' {
+			continue
+		}
+		for j < len(line) && line[j] >= '0' && line[j] <= '9' {
+			j++
+		}
+		if j < len(line) && (line[j] == ':' || line[j] == '-') {
+			return line[:i], line[i:], true
+		}
+	}
+	return "", "", false
+}
+
+func relativizeGrepPath(ctx context.Context, searchRoot, path string) string {
+	if path == "" {
+		return path
+	}
+	if !filepath.IsAbs(path) {
+		return filepath.ToSlash(filepath.Clean(path))
+	}
+	base := cwdctx.FromContext(ctx)
+	if base == "" {
+		base = searchRoot
+		if info, err := os.Stat(base); err == nil && !info.IsDir() {
+			base = filepath.Dir(base)
+		}
+	}
+	if rel, err := filepath.Rel(base, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		if rel == "." {
+			return filepath.ToSlash(filepath.Base(path))
+		}
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(path)
 }
 
 func (t *GrepTool) RequiresApproval() bool { return true }

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,16 @@ const maxPDFPages = 2
 // pdfPageMaxDim is the max pixel dimension for rendered PDF pages.
 const pdfPageMaxDim = 1024
 
+// fileReadMaxTokens is the hard cap on text file_read output. Files (or
+// offset+limit slices) whose estimated token count exceeds this return an
+// error pointing the agent at offset/limit instead of letting the loop's
+// 50K spill fallback drop a 2K preview into context. ~100B error vs ~2K
+// spill preview ≈ 95% per-call savings on oversized reads. Mirrors CC's
+// DEFAULT_MAX_OUTPUT_TOKENS in src/tools/FileReadTool/limits.ts:18.
+const fileReadMaxTokens = 25000
+
+const fileReadNoLimitMaxBytes = 256 * 1024
+
 type FileReadTool struct{}
 
 type fileReadArgs struct {
@@ -42,8 +53,9 @@ type fileReadArgs struct {
 
 func (t *FileReadTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "file_read",
-		Description: "Read a file's contents with line numbers. Use offset and limit for large files. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages).",
+		Name:               "file_read",
+		MaxResultSizeChars: agent.UnlimitedToolResultSizeChars,
+		Description:        "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages).",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -83,32 +95,119 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		return t.readPDF(args.Path, args.Offset, args.Limit)
 	}
 
-	data, err := os.ReadFile(args.Path)
-	if err != nil {
-		if os.IsPermission(err) {
-			return agent.PermissionError(fmt.Sprintf("cannot read %s: permission denied", args.Path)), nil
+	// Dedup check: when the same (path, offset, limit) was read earlier in
+	// the session AND the file's mtime+size are unchanged, return a ~120B
+	// stub instead of replaying the full content. Skipped above for
+	// images/PDFs (they return image blocks, not text). No-op when there's
+	// no ReadTracker in context (tool called outside the agent loop).
+	info, statErr := os.Stat(args.Path)
+	if statErr == nil {
+		if hit, stub := agent.CheckFileReadDedup(ctx, args.Path, args.Offset, args.Limit, info.ModTime(), info.Size()); hit {
+			return agent.ToolResult{Content: stub}, nil
 		}
-		return agent.ToolResult{Content: fmt.Sprintf("error reading file: %v", err), IsError: true}, nil
 	}
 
-	lines := strings.Split(string(data), "\n")
 	start := args.Offset
 	if start < 0 {
 		start = 0
 	}
-	if start > len(lines) {
-		start = len(lines)
+	if args.Limit <= 0 && statErr == nil && info.Size() > fileReadNoLimitMaxBytes {
+		return agent.ToolResult{
+			IsError: true,
+			Content: fmt.Sprintf(
+				"file_read: file is too large (%d bytes). Use offset+limit to read a smaller range, e.g. {\"offset\":0,\"limit\":200}.",
+				info.Size(),
+			),
+		}, nil
 	}
-	end := len(lines)
-	if args.Limit > 0 && start+args.Limit < end {
-		end = start + args.Limit
+
+	var (
+		lines      []string
+		totalLines int
+		err        error
+	)
+	if args.Limit > 0 {
+		lines, totalLines, _, err = readTextLineRange(args.Path, start, args.Limit)
+		if err != nil {
+			if os.IsPermission(err) {
+				return agent.PermissionError(fmt.Sprintf("cannot read %s: permission denied", args.Path)), nil
+			}
+			return agent.ToolResult{Content: fmt.Sprintf("error reading file: %v", err), IsError: true}, nil
+		}
+	} else {
+		data, err := os.ReadFile(args.Path)
+		if err != nil {
+			if os.IsPermission(err) {
+				return agent.PermissionError(fmt.Sprintf("cannot read %s: permission denied", args.Path)), nil
+			}
+			return agent.ToolResult{Content: fmt.Sprintf("error reading file: %v", err), IsError: true}, nil
+		}
+		lines = strings.Split(string(data), "\n")
+		totalLines = len(lines)
+		if start > len(lines) {
+			start = len(lines)
+		}
+	}
+
+	// Estimate output tokens on the requested slice (NOT the whole file —
+	// asking for limit=100 of a 10K-line file should succeed). chars/3 is
+	// a coarse but safe estimate for English/code text.
+	var sliceChars int
+	for i := range lines {
+		sliceChars += len(lines[i]) + 1 // +1 for newline
+	}
+	if estTokens := sliceChars / 3; estTokens > fileReadMaxTokens {
+		return agent.ToolResult{
+			IsError: true,
+			Content: fmt.Sprintf(
+				"file_read: requested range too large (~%d tokens, max %d). File has %d lines; use offset+limit to read smaller chunks (e.g. limit=200 reads ~200 lines).",
+				estTokens, fileReadMaxTokens, totalLines,
+			),
+		}, nil
 	}
 
 	var sb strings.Builder
-	for i := start; i < end; i++ {
-		fmt.Fprintf(&sb, "%4d | %s\n", i+1, lines[i])
+	for i, line := range lines {
+		fmt.Fprintf(&sb, "%4d | %s\n", start+i+1, line)
+	}
+	// Record this read for future dedup. Stat may have failed earlier
+	// (race with file removal); skip recording in that case.
+	if statErr == nil {
+		agent.RecordFileRead(ctx, args.Path, args.Offset, args.Limit, info.ModTime(), info.Size())
 	}
 	return agent.ToolResult{Content: sb.String()}, nil
+}
+
+func readTextLineRange(path string, offset, limit int) (lines []string, totalLines int, reachedEOF bool, err error) {
+	if offset < 0 {
+		offset = 0
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	end := -1
+	if limit > 0 {
+		end = offset + limit
+	}
+	for scanner.Scan() {
+		if end >= 0 && totalLines >= end {
+			return lines, totalLines, false, scanner.Err()
+		}
+		text := scanner.Text()
+		if totalLines >= offset {
+			lines = append(lines, text)
+		}
+		totalLines++
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, totalLines, false, err
+	}
+	return lines, totalLines, true, nil
 }
 
 // readImage reads an image file and returns it as a vision-compatible image block.

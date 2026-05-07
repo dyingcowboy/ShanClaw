@@ -32,8 +32,9 @@ type BashTool struct {
 }
 
 type bashArgs struct {
-	Command string `json:"command"`
-	Timeout int    `json:"timeout,omitempty"`
+	Command        string `json:"command"`
+	Timeout        int    `json:"timeout,omitempty"`
+	MaxOutputChars int    `json:"max_output_chars,omitempty"`
 }
 
 var safeCommands = []string{
@@ -71,13 +72,46 @@ func isSafeCommand(cmd string, extraSafe []string) bool {
 
 func (t *BashTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "bash",
-		Description: "Execute a shell command. Use for running scripts, data processing, file management, automation, and system operations. For multi-line Python with embedded quotes or regex, prefer writing a script via file_write and then running `python3 /path/to/script.py` — heredoc+quote nesting is a frequent source of shell-level syntax errors.",
+		Name:               "bash",
+		MaxResultSizeChars: 30000,
+		Description: `Execute a shell command. Use for running scripts, data processing, file management, automation, and system operations.
+
+Each command runs in a fresh shell. The starting directory is the session CWD, but cd/export/aliases from one bash call do NOT persist to later calls.
+
+IMPORTANT: Avoid using this tool to run cat, head, tail, sed, awk, grep, find, or ls commands unless explicitly instructed or after verifying that a dedicated tool cannot accomplish your task. Use the appropriate dedicated tool instead:
+- Read files: file_read (NOT cat/head/tail)
+- Edit files: file_edit (NOT sed/awk)
+- Write files: file_write (NOT echo > / cat <<EOF)
+- File search: glob (NOT find)
+- Content search: grep (NOT bash grep/rg)
+- List directory: directory_list (NOT ls)
+
+While bash can do similar things, the dedicated tools have better permission handling, output truncation, and result shaping.
+
+Instructions:
+- Always quote file paths that contain spaces with double quotes (e.g., cd "path with spaces/file").
+- Prefer absolute paths over cd to keep the working directory stable.
+- For multi-line Python with embedded quotes or regex, write a script via file_write then run python3 /path/to/script.py — heredoc+quote nesting is a frequent source of shell syntax errors.
+- When issuing multiple commands:
+  - If independent and can run in parallel, make multiple bash tool calls in a single response. Example: "git status" and "git diff" together — send a single response with two bash calls in parallel.
+  - If commands depend on each other, chain with && in a single bash call.
+  - Use ';' only when sequential execution is needed and earlier failures don't matter.
+  - DO NOT use newlines to separate commands (newlines inside quoted strings are fine).
+- For git commands:
+  - Prefer creating a new commit over amending an existing commit.
+  - Before destructive operations (git reset --hard, git push --force, git checkout --), consider safer alternatives. Only use destructive operations when truly the best approach.
+  - Never skip hooks (--no-verify) or bypass signing unless the user explicitly asked. If a hook fails, investigate and fix the underlying issue.
+- Avoid unnecessary sleep commands:
+  - Do not sleep between commands that can run immediately — just run them.
+  - Do not retry failing commands in a sleep loop — diagnose the root cause.
+  - If polling an external process, use a check command rather than sleeping first.
+  - If you must sleep, keep duration short (1-5 seconds).`,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"command": map[string]any{"type": "string", "description": "Shell command to execute"},
-				"timeout": map[string]any{"type": "integer", "description": "Timeout in seconds (default: 120)"},
+				"command":          map[string]any{"type": "string", "description": "Shell command to execute"},
+				"timeout":          map[string]any{"type": "integer", "description": "Timeout in seconds (default: 120)"},
+				"max_output_chars": map[string]any{"type": "integer", "description": "Maximum output characters to return. Use this for noisy commands."},
 			},
 		},
 		Required: []string{"command"},
@@ -125,6 +159,9 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	maxOut := t.MaxOutput
 	if maxOut <= 0 {
 		maxOut = 30000
+	}
+	if args.MaxOutputChars > 0 {
+		maxOut = args.MaxOutputChars
 	}
 	if r := []rune(result); len(r) > maxOut {
 		keepHead := maxOut * 3 / 4

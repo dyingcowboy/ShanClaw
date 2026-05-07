@@ -219,7 +219,7 @@ IMPORTANT: Do NOT use bash to run find, grep, cat, head, tail, sed, awk, or ls c
 - NEVER fabricate web page content. If browser_* tools returned empty content, an anti-bot warning, or errors, report the failure honestly to the user. Do NOT invent product listings, prices, reviews, or any data that was not present in the actual tool result. State clearly: "I was unable to access/extract data from [site] because [reason]."
 
 ### Planning
-- think: Use this to plan or reason through complex multi-step tasks before acting. Always use this instead of outputting plans as plain text.
+- think: Append a structured thought to the log when complex reasoning or sequential decisions are needed (long tool chains, policy-heavy tasks). Does not obtain new information or change state. For simpler reasoning extended thinking handles it natively — don't reach for this tool by default.
 
 ### System
 - system_info: OS/hardware information.
@@ -385,9 +385,10 @@ type EventHandler interface {
 //
 // Known codes:
 //
-//	"idle_soft"  — no activity for IdleSoftTimeout; informational, turn continues
-//	"idle_hard"  — no activity for IdleHardTimeout; turn about to be cancelled
-//	"llm_retry"  — transient LLM error, retrying
+//	"idle_soft"     — no activity for IdleSoftTimeout; informational, turn continues
+//	"idle_hard"     — no activity for IdleHardTimeout; turn about to be cancelled
+//	"llm_retry"     — transient LLM error, retrying
+//	"context_bloat" — large tool results are dominating context; informational
 type RunStatusHandler interface {
 	OnRunStatus(code string, detail string)
 }
@@ -438,10 +439,21 @@ type AgentLoop struct {
 	runMsgInjected    []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps  []time.Time      // parallel to runMessages: when each message was created
 	lastRunStatus     RunStatus
-	toolRefSupported  bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource       string // tag sent to gateway on every Complete call for prompt-cache TTL routing
-	skillDiscovery    bool              // call small-tier model on first turn to identify relevant skills (default true)
-	sentSkillNames    map[string]bool   // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	toolRefSupported  bool            // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource       string          // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	skillDiscovery    bool            // call small-tier model on first turn to identify relevant skills (default true)
+	sentSkillNames    map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker       *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	// toolResultReplacements stores stable query-time replacements for large
+	// historical tool_result blocks. It is session-scoped and persisted by
+	// daemon/TUI callers so resumed sessions replay identical bytes.
+	toolResultReplacements *ToolResultReplacementState
+
+	// toolResultPolicyCache memoizes the tool-name → MaxResultSizeChars map.
+	// Tools are registered once before NewAgentLoop returns and never mutate
+	// during Run(), so iterating tools.All() per LLM call is wasted work in
+	// long loops.
+	toolResultPolicyCache map[string]int
 
 	// Time-based microcompact (see internal/agent/timebasedcompact.go).
 	// Default disabled. When enabled, fires only when (now - lastAssistantAt)
@@ -506,18 +518,20 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 		argsTrunc = 200
 	}
 	return &AgentLoop{
-		client:         gw,
-		tools:          tools,
-		modelTier:      modelTier,
-		shannonDir:     shannonDir,
-		maxIter:        maxIter,
-		resultTrunc:    resultTrunc,
-		argsTrunc:      argsTrunc,
-		permissions:    perms,
-		auditor:        auditor,
-		hookRunner:     hookRunner,
-		workingSet:     NewWorkingSet(),
-		skillDiscovery: true,
+		client:                 gw,
+		tools:                  tools,
+		modelTier:              modelTier,
+		shannonDir:             shannonDir,
+		maxIter:                maxIter,
+		resultTrunc:            resultTrunc,
+		argsTrunc:              argsTrunc,
+		permissions:            perms,
+		auditor:                auditor,
+		hookRunner:             hookRunner,
+		workingSet:             NewWorkingSet(),
+		skillDiscovery:         true,
+		readTracker:            NewReadTracker(),
+		toolResultReplacements: NewToolResultReplacementState(nil),
 	}
 }
 
@@ -618,6 +632,19 @@ func (a *AgentLoop) SetMCPContext(ctx string) {
 // Empty string is treated as "unknown" (5m fallback) by Shannon.
 func (a *AgentLoop) SetCacheSource(src string) {
 	a.cacheSource = src
+}
+
+// SetReadTracker injects an externally-owned ReadTracker so file_read dedup
+// history can persist across multiple AgentLoop instances within one logical
+// session. Daemon callers create one tracker per session_id and inject it
+// into every per-turn AgentLoop instance — without this, each new turn loses
+// the dedup map (NewAgentLoop creates a fresh tracker by default). Pass nil
+// to keep the default per-loop tracker. Must be called before Run().
+func (a *AgentLoop) SetReadTracker(rt *ReadTracker) {
+	if rt == nil {
+		return
+	}
+	a.readTracker = rt
 }
 
 func (a *AgentLoop) SetBypassPermissions(bypass bool) {
@@ -722,6 +749,81 @@ func (a *AgentLoop) RunMessages() []client.Message {
 	}
 	out := make([]client.Message, len(a.runMessages))
 	copy(out, a.runMessages)
+	return out
+}
+
+// SetToolResultReplacements restores session-scoped query-time tool_result
+// replacements. Callers should invoke this before Run() when resuming a
+// persisted session.
+func (a *AgentLoop) SetToolResultReplacements(replacements map[string]string) {
+	a.SetToolResultBudgetState(replacements, nil)
+}
+
+// SetToolResultBudgetState restores session-scoped query-time tool_result
+// budget state. Replacements imply seen=true; explicit seen IDs freeze
+// unreplaced results so later policy changes do not mutate old history.
+func (a *AgentLoop) SetToolResultBudgetState(replacements map[string]string, seen map[string]bool) {
+	a.toolResultReplacements = NewToolResultReplacementState(replacements)
+	for id, ok := range seen {
+		if ok && strings.TrimSpace(id) != "" {
+			a.toolResultReplacements.Seen[id] = true
+		}
+	}
+}
+
+// ToolResultReplacements returns a JSON-persistable snapshot of query-time
+// replacements created or replayed by this loop.
+func (a *AgentLoop) ToolResultReplacements() map[string]string {
+	if a.toolResultReplacements == nil {
+		return nil
+	}
+	return a.toolResultReplacements.Snapshot()
+}
+
+// ToolResultSeen returns a JSON-persistable snapshot of tool_use IDs already
+// processed by the query-time budget.
+func (a *AgentLoop) ToolResultSeen() map[string]bool {
+	if a.toolResultReplacements == nil || len(a.toolResultReplacements.Seen) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(a.toolResultReplacements.Seen))
+	for id, ok := range a.toolResultReplacements.Seen {
+		if ok {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
+	if a.toolResultReplacements == nil {
+		a.toolResultReplacements = NewToolResultReplacementState(nil)
+	}
+	opts := defaultToolResultBudgetOptions(a.shannonDir, a.sessionID)
+	opts.ToolMaxResultSizeChars = a.toolResultPolicy()
+	out, changed := applyToolResultBudget(messages, a.toolResultReplacements, opts)
+	if changed && a.tracker != nil {
+		a.tracker.MarkDirty()
+	}
+	return out
+}
+
+func (a *AgentLoop) toolResultPolicy() map[string]int {
+	if a.tools == nil {
+		return nil
+	}
+	if a.toolResultPolicyCache != nil {
+		return a.toolResultPolicyCache
+	}
+	out := make(map[string]int)
+	for _, tool := range a.tools.All() {
+		info := tool.Info()
+		if info.Name == "" {
+			continue
+		}
+		out[info.Name] = info.MaxResultSizeChars
+	}
+	a.toolResultPolicyCache = out
 	return out
 }
 
@@ -1315,8 +1417,14 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// of the messages slice. Call immediately after appending any message.
 	stampMessage := func() { msgTimestamps[len(messages)-1] = time.Now() }
 
-	// Read tracker: enforces read-before-edit for file_edit/file_write
-	readTracker := NewReadTracker()
+	// Read tracker: read-before-edit is per turn, but file_read dedup history is
+	// session-scoped when the same AgentLoop instance is reused across Runs.
+	readTracker := a.readTracker
+	if readTracker == nil {
+		readTracker = NewReadTracker()
+		a.readTracker = readTracker
+	}
+	readTracker.ResetTurnReads()
 	readTracker.SetCWD(cwd)
 	// Pre-seed MEMORY.md as "read" — its content is already in the system prompt,
 	// so the agent can file_edit it directly without a redundant file_read.
@@ -1365,34 +1473,35 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 	var (
-		detector             = NewLoopDetector()
-		toolsUsed            = make(map[string]int)
-		totalToolCalls       int
-		lastText             string
-		streamingText        strings.Builder // accumulates streaming deltas for cancel recovery
-		truncatedText        strings.Builder // accumulates text from max_tokens continuations
-		continuationCount    int
-		afterCheckpoint      bool
-		checkpointDone       bool
-		nudges               = newNudgeWindow(maxNudges, nudgeWindowIters)
-		hallucinationNudges  int
-		lastPromptTokens     int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
-		lastOutputTokens     int    // actual output tokens from last LLM response
-		compactionSummary    string // cached summary from compaction
-		compactionApplied    bool   // true once messages have been shaped
-		reactiveCompacted    bool   // true once reactive compaction fired (never resets)
-		summaryFailures        int // consecutive summary failures; backs off after 3
+		detector            = NewLoopDetector()
+		toolsUsed           = make(map[string]int)
+		totalToolCalls      int
+		lastText            string
+		streamingText       strings.Builder // accumulates streaming deltas for cancel recovery
+		truncatedText       strings.Builder // accumulates text from max_tokens continuations
+		continuationCount   int
+		afterCheckpoint     bool
+		checkpointDone      bool
+		nudges              = newNudgeWindow(maxNudges, nudgeWindowIters)
+		hallucinationNudges int
+		lastPromptTokens    int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
+		lastOutputTokens    int    // actual output tokens from last LLM response
+		compactionSummary   string // cached summary from compaction
+		compactionApplied   bool   // true once messages have been shaped
+		reactiveCompacted   bool   // true once reactive compaction fired (never resets)
+		summaryFailures     int    // consecutive summary failures; backs off after 3
 		// lastSummaryFailureIter records the iteration of the most recent summary
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
 		// short-circuits the distance check until a real failure streak writes it.
 		lastSummaryFailureIter int
 		toolSearchFired        bool
-		latestUserText       = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
-		cloudNudgeFired      bool
-		cloudDelegateClaimed bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
-		cloudResultContent   string // non-empty when a cloud deliverable should bypass LLM summarization
-		lastDiscoveryInput   string // dedup: skip discovery when user text hasn't changed between iterations
+		latestUserText         = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
+		cloudNudgeFired        bool
+		cloudDelegateClaimed   bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
+		cloudResultContent     string // non-empty when a cloud deliverable should bypass LLM summarization
+		lastDiscoveryInput     string // dedup: skip discovery when user text hasn't changed between iterations
+		contextBloatStatusSent bool
 
 		// Cross-iteration dedup: cache successful results from previous iteration
 		// to prevent re-execution of identical tool calls across consecutive iterations.
@@ -1470,7 +1579,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 
 		req := client.CompletionRequest{
-			Messages:        messages,
+			Messages:        a.messagesForLLM(messages),
 			ModelTier:       a.modelTier,
 			SpecificModel:   a.specificModel,
 			Temperature:     a.temperature,
@@ -1948,11 +2057,20 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			stickyInjectPending = false
 		}
 
+		if !contextBloatStatusSent {
+			if detail := buildContextBloatSuggestion(messages, ContextBloatOptions{}); detail != "" {
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					rs.OnRunStatus("context_bloat", detail)
+				}
+				contextBloatStatusSent = true
+			}
+		}
+
 		// Call LLM — streaming or blocking
 		var resp *client.CompletionResponse
 		var err error
 		req := client.CompletionRequest{
-			Messages:        messages,
+			Messages:        a.messagesForLLM(messages),
 			ModelTier:       a.modelTier,
 			SpecificModel:   a.specificModel,
 			Temperature:     a.temperature,
@@ -2137,7 +2255,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 				// Rebuild request with compacted messages.
 				req = client.CompletionRequest{
-					Messages:        messages,
+					Messages:        a.messagesForLLM(messages),
 					ModelTier:       a.modelTier,
 					SpecificModel:   a.specificModel,
 					Temperature:     a.temperature,
@@ -2594,6 +2712,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			batches := partitionToolCalls(approved)
 			a.tracker.Enter(PhaseExecutingTools)
 			executeBatches(ctx, batches, execResults, readTracker, a.handler)
+			// Per-turn aggregate cap: even when each result is below the 50K
+			// per-result spillThreshold, parallel of N tools returning
+			// 30K each can put hundreds of KB into one user message. Spill
+			// the largest result(s) to bring the sum under 200K. No-op for
+			// turns with small or few results.
+			applyAggregateCap(execResults, a.shannonDir, a.sessionID)
 			a.tracker.MarkDirty() // tool batch is durable state for checkpoint
 			// Fire mid-turn checkpoint after captureRunMessages below, so
 			// RunMessages() reflects the just-completed batch. The actual
@@ -2633,6 +2757,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 		// ---- Phase 3 (serial): post-hooks, audit, events, context recording, loop detection ----
 		// Iterate ALL tool calls in original order so results are recorded in the correct sequence.
+		toolResultPolicy := a.toolResultPolicy()
 		for idx, fc := range toolCalls {
 			argsStr := callMeta[idx].argsStr
 			decision := callMeta[idx].decision
@@ -2696,19 +2821,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 			}
 
-			// Disk spill: results > 50K chars are saved to a temp file and
-			// replaced with a short preview so they don't blow up context.
-			if len([]rune(cleanResult)) > spillThreshold {
-				if spilled, spillErr := spillToDisk(a.shannonDir, a.sessionID, generateCallID(), cleanResult); spillErr == nil {
-					cleanResult = spilled
-				}
-				// On spill error, fall through to normal truncation.
-			}
+			// Disk spill: large results are saved to disk and replaced with a
+			// preview before they enter conversation context. Per-tool policy
+			// can lower the default 50K threshold (e.g. grep=20K, bash=30K).
+			cleanResult = applyPerResultSpill(cleanResult, fc.Name, a.shannonDir, a.sessionID, toolResultPolicy)
 
-			maxChars := a.resultTrunc
-			if result.CloudResult {
-				maxChars = 60000
-			}
+			maxChars := contextResultMaxChars(fc.Name, result.CloudResult, a.resultTrunc, toolResultPolicy)
 			contextResult := truncateStr(cleanResult, maxChars)
 
 			// System reminders: append short contextual hints to high-signal

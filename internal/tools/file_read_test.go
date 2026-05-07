@@ -2,9 +2,15 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
 func TestFileRead_Run(t *testing.T) {
@@ -22,6 +28,49 @@ func TestFileRead_Run(t *testing.T) {
 	}
 	if !contains(result.Content, "1") || !contains(result.Content, "line1") {
 		t.Errorf("expected line-numbered output, got: %s", result.Content)
+	}
+}
+
+func TestFileReadTool_LargeFileRequiresRange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "large.txt")
+	body := strings.Repeat("0123456789abcdef\n", 20000)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := &FileReadTool{}
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "file is too large") || !strings.Contains(result.Content, "Use offset+limit") {
+		t.Fatalf("expected range guidance error, got: %#v", result)
+	}
+}
+
+func TestFileReadTool_LargeFileRangeSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "large.txt")
+	var sb strings.Builder
+	for i := 0; i < 10000; i++ {
+		fmt.Fprintf(&sb, "line-%05d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := &FileReadTool{}
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`","offset":100,"limit":2}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("range read failed: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, " 101 | line-00100") || !strings.Contains(result.Content, " 102 | line-00101") {
+		t.Fatalf("unexpected range output: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "line-09999") {
+		t.Fatalf("range read leaked far-away content")
 	}
 }
 
@@ -122,5 +171,212 @@ func TestFileRead_RelativePathRefusedWithoutSessionCWD(t *testing.T) {
 	}
 	if !contains(result.Content, "session working directory") && !contains(result.Content, "absolute path") {
 		t.Errorf("expected guard message, got: %s", result.Content)
+	}
+}
+
+// TestFileRead_OversizeThrows: a file whose content exceeds fileReadMaxTokens
+// must return an IsError result with offset+limit guidance, NOT silently
+// truncate or fall through to the loop's spill path.
+func TestFileRead_OversizeThrows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	// 10K lines × 30 chars = 300K chars ≈ 100K tokens (well above 25K cap)
+	var sb strings.Builder
+	for i := 0; i < 10000; i++ {
+		sb.WriteString("0123456789012345678901234567890\n")
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+	result, err := tool.Run(context.Background(), string(args))
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected IsError on oversized read, got success with %d bytes", len(result.Content))
+	}
+	if !strings.Contains(result.Content, "too large") {
+		t.Errorf("error must mention 'too large', got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "offset") || !strings.Contains(result.Content, "limit") {
+		t.Errorf("error must guide to offset+limit, got: %s", result.Content)
+	}
+	// Sanity: error is short (~100B target), not the full file content.
+	if len(result.Content) > 1000 {
+		t.Errorf("error message should be short (~100B), got %d bytes", len(result.Content))
+	}
+}
+
+// TestFileRead_OversizeRespectsLimit: same big file, but with a reasonable
+// limit slice — must succeed (the cap is on the SLICE, not the file).
+func TestFileRead_OversizeRespectsLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	var sb strings.Builder
+	for i := 0; i < 10000; i++ {
+		sb.WriteString("0123456789012345678901234567890\n")
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path, Limit: 100})
+	result, err := tool.Run(context.Background(), string(args))
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("100-line slice of big file should succeed, got error: %s", result.Content)
+	}
+	// 100 lines × ~33 chars = ~3300 chars ~ 1100 tokens — well below 25K cap.
+	// Verify content has the line-number prefix and reasonable length.
+	if !strings.Contains(result.Content, "   1 |") {
+		t.Errorf("expected line number prefix in slice content, got first 200 bytes: %s", result.Content[:min(200, len(result.Content))])
+	}
+}
+
+// TestFileRead_DedupSameFile_SameRange verifies that two reads of the same
+// (path, offset, limit) tuple within one session — with no file modification
+// in between — return a short "unchanged" stub on the second call.
+func TestFileRead_DedupSameFile_SameRange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("line1\nline2\nline3\n"), 0o644)
+
+	tracker := agent.NewReadTracker()
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+
+	tool := &FileReadTool{}
+
+	// First read: full content
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+	r1, err := tool.Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("first read transport error: %v", err)
+	}
+	if r1.IsError {
+		t.Fatalf("first read error: %s", r1.Content)
+	}
+	if !strings.Contains(r1.Content, "line1") {
+		t.Errorf("first read should contain content, got: %s", r1.Content)
+	}
+
+	// Second read with SAME args: should dedup → stub
+	r2, err := tool.Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("second read transport error: %v", err)
+	}
+	if r2.IsError {
+		t.Fatalf("dedup hit should not be IsError: %s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "unchanged since last read") {
+		t.Errorf("expected dedup stub, got: %s", r2.Content)
+	}
+	if strings.Contains(r2.Content, "line1") {
+		t.Errorf("dedup stub should NOT contain file content, got: %s", r2.Content)
+	}
+	if len(r2.Content) > 200 {
+		t.Errorf("dedup stub should be short (~120B), got %d bytes", len(r2.Content))
+	}
+}
+
+// TestFileRead_DedupSameFile_DifferentRange: a second read with different
+// offset+limit must NOT dedup — model is asking for a different slice.
+func TestFileRead_DedupSameFile_DifferentRange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("line1\nline2\nline3\nline4\nline5\n"), 0o644)
+
+	tracker := agent.NewReadTracker()
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+
+	tool := &FileReadTool{}
+
+	// First read: limit=2 (lines 1-2)
+	args1, _ := json.Marshal(fileReadArgs{Path: path, Limit: 2})
+	r1, _ := tool.Run(ctx, string(args1))
+	if r1.IsError {
+		t.Fatalf("first read error: %s", r1.Content)
+	}
+
+	// Second read with different limit=4 — must return real content, NOT stub
+	args2, _ := json.Marshal(fileReadArgs{Path: path, Limit: 4})
+	r2, err := tool.Run(ctx, string(args2))
+	if err != nil {
+		t.Fatalf("second read transport error: %v", err)
+	}
+	if r2.IsError {
+		t.Fatalf("second read should succeed: %s", r2.Content)
+	}
+	if strings.Contains(r2.Content, "unchanged since last read") {
+		t.Errorf("different range must NOT dedup, got stub: %s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "line4") {
+		t.Errorf("expected line4 in expanded read, got: %s", r2.Content)
+	}
+}
+
+// TestFileRead_DedupSameFile_FileModified: when the file is modified between
+// reads, dedup must NOT fire (mtime check catches it).
+func TestFileRead_DedupSameFile_FileModified(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("v1\n"), 0o644)
+
+	tracker := agent.NewReadTracker()
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+	tool.Run(ctx, string(args)) // first read
+
+	// Modify file (sleep 10ms first to ensure mtime ticks on filesystems
+	// with sub-second mtime resolution; macOS APFS has nanosecond mtime
+	// but kernel timer ticks may coalesce).
+	time.Sleep(15 * time.Millisecond)
+	os.WriteFile(path, []byte("v2 changed\n"), 0o644)
+
+	r2, err := tool.Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("second read transport error: %v", err)
+	}
+	if r2.IsError {
+		t.Fatalf("second read error: %s", r2.Content)
+	}
+	if strings.Contains(r2.Content, "unchanged since last read") {
+		t.Errorf("modified file must NOT dedup, got stub: %s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "v2 changed") {
+		t.Errorf("expected new content, got: %s", r2.Content)
+	}
+}
+
+// TestFileRead_DedupSameFile_NoTracker: without a tracker in context, dedup
+// is a no-op (always returns full content).
+func TestFileRead_DedupSameFile_NoTracker(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("line1\n"), 0o644)
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+
+	// Two reads in plain context — both return full content.
+	r1, _ := tool.Run(context.Background(), string(args))
+	r2, _ := tool.Run(context.Background(), string(args))
+	for i, r := range []agent.ToolResult{r1, r2} {
+		if r.IsError {
+			t.Fatalf("read %d error: %s", i, r.Content)
+		}
+		if !strings.Contains(r.Content, "line1") {
+			t.Errorf("read %d should contain content, got: %s", i, r.Content)
+		}
+		if strings.Contains(r.Content, "unchanged") {
+			t.Errorf("read %d should not dedup without tracker, got: %s", i, r.Content)
+		}
 	}
 }
