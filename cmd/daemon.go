@@ -252,6 +252,16 @@ var daemonStartCmd = &cobra.Command{
 				switch deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
 				case daemon.InjectOK:
 					// Message injected — running loop will incorporate it.
+					// Suppress the explicit ack on messaging platforms: the user's
+					// own message is already visible in the thread and the active
+					// run's streamer (Slack/Feishu/WeCom) is already updating an
+					// in-place "Processing..." block. The bracket text would just
+					// be persistent noise. CLI/TUI flows still get the ack so
+					// users typing into a running agent know their input was
+					// queued. See daemon.IsMessagingPlatform.
+					if daemon.IsMessagingPlatform(source) {
+						return ""
+					}
 					return "[message received, processing...]"
 				case daemon.InjectQueueFull:
 					// Active run exists but queue saturated — don't start a new run.
