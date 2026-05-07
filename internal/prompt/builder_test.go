@@ -607,12 +607,13 @@ func TestBuildSystemPrompt_CommunicatingSection_Present(t *testing.T) {
 	})
 
 	required := []string{
-		"## Communicating with the user",
-		"Before your first tool call, briefly state what you're about to do",
+		"## Text output (does not apply to tool calls)",
+		"Before your first tool call, state in one sentence what you're about to do",
 		"give short updates at key moments",
-		"Don't open updates with conversational interjections",
-		"Routine tool calls don't need narration",
-		"Preamble is not a final answer",
+		"Brief is good — silent is not",
+		"Don't narrate your internal deliberation",
+		"Don't open with conversational interjections",
+		"End-of-turn summary",
 		"Do not use a colon before a tool call",
 	}
 	for _, phrase := range required {
