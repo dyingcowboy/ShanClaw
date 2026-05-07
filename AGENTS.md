@@ -176,6 +176,7 @@ Unknown tools are denied by default. The always-ask gate runs BEFORE the allowli
 ### Daemon Architecture
 
 - Daemon connects to Shannon Cloud via WebSocket, receives channel messages, and runs the agent loop locally.
+- WS handshake advertises daemon version (`X-ShanClaw-Daemon-Version`) and an opt-in capability list (`X-ShanClaw-Capabilities`) on the HTTP upgrade. Cloud gates optional protocol features on capability presence so older daemons aren't subjected to flows they can't honor. Add a capability token in the same PR that ships the feature.
 - Route keys are computed as (precedence: top wins):
   - `session:<id>` for explicit session resume
   - `default:<source>:<thread>` (or `agent:<name>:<source>:<thread>`) for messaging platforms with a thread

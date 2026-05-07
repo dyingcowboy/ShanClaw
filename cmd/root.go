@@ -23,6 +23,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	mcppkg "github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
@@ -629,6 +630,7 @@ func init() {
 }
 
 func Execute() {
+	daemon.Version = Version
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

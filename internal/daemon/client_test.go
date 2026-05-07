@@ -71,6 +71,105 @@ func TestClient_SendEnvelope_WritesToConn(t *testing.T) {
 	}
 }
 
+// TestConnect_AdvertisesVersionAndUserAgent confirms every WS upgrade sends
+// X-ShanClaw-Daemon-Version and a User-Agent containing the version, OS, and
+// arch. Cloud reads these headers for telemetry and version-bug fallback
+// signals; without them, Cloud cannot tell which daemon build is connected.
+func TestConnect_AdvertisesVersionAndUserAgent(t *testing.T) {
+	prev := Version
+	Version = "0.1.3-test"
+	defer func() { Version = prev }()
+
+	captured := make(chan http.Header, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hdr := r.Header.Clone()
+		captured <- hdr
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c := NewClient(wsURL, "", nil, nil)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	select {
+	case hdr := <-captured:
+		if got := hdr.Get("X-ShanClaw-Daemon-Version"); got != "0.1.3-test" {
+			t.Errorf("X-ShanClaw-Daemon-Version = %q, want %q", got, "0.1.3-test")
+		}
+		ua := hdr.Get("User-Agent")
+		if !strings.Contains(ua, "shanclaw/0.1.3-test") {
+			t.Errorf("User-Agent = %q, want to contain %q", ua, "shanclaw/0.1.3-test")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not see upgrade request")
+	}
+}
+
+// TestConnect_AdvertisesCapabilities confirms the X-ShanClaw-Capabilities
+// header carries every token in the package-level Capabilities slice and is
+// omitted entirely when the slice is empty (so Cloud's "no header = legacy"
+// invariant holds for daemons that haven't enabled any opt-in features).
+func TestConnect_AdvertisesCapabilities(t *testing.T) {
+	tests := []struct {
+		name        string
+		caps        []string
+		wantHeader  string
+		wantPresent bool
+	}{
+		{name: "empty slice omits header", caps: nil, wantHeader: "", wantPresent: false},
+		{name: "single capability", caps: []string{"delivery_ack"}, wantHeader: "delivery_ack", wantPresent: true},
+		{name: "multiple capabilities preserved in order", caps: []string{"delivery_ack", "future_feature"}, wantHeader: "delivery_ack,future_feature", wantPresent: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prev := Capabilities
+			Capabilities = tt.caps
+			defer func() { Capabilities = prev }()
+
+			captured := make(chan http.Header, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				captured <- r.Header.Clone()
+				upgrader := websocket.Upgrader{}
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+			}))
+			defer srv.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+			c := NewClient(wsURL, "", nil, nil)
+			if err := c.Connect(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+
+			select {
+			case hdr := <-captured:
+				_, present := hdr["X-Shanclaw-Capabilities"]
+				if present != tt.wantPresent {
+					t.Errorf("header presence = %v, want %v", present, tt.wantPresent)
+				}
+				if got := hdr.Get("X-ShanClaw-Capabilities"); got != tt.wantHeader {
+					t.Errorf("X-ShanClaw-Capabilities = %q, want %q", got, tt.wantHeader)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("server did not see upgrade request")
+			}
+		})
+	}
+}
+
 func TestClient_ConnectionState(t *testing.T) {
 	c := NewClient("ws://localhost:1/x", "", nil, nil)
 	if c.IsConnected() {
