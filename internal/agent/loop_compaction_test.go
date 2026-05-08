@@ -1324,15 +1324,13 @@ func TestEffectiveContextWindow_AutoFromModel(t *testing.T) {
 		{"auto on, sonnet 4.6 → 1M", true, 128000, "claude-sonnet-4-6", "", 1_000_000},
 		{"auto on, haiku 4.5 → 200K", true, 128000, "claude-haiku-4-5", "", 200_000},
 		{"auto on, unknown → config value", true, 128000, "", "", 128000},
-		// Tier-only resolution returns the conservative 200K floor as of the
-		// 2026-05-08 review's Open Question fix. Cloud-side priority/failover
-		// can land on non-auto-1M models (sonnet-4-5 in medium, gpt-5.1 in
-		// large), so trusting tier=medium → 1M would defeat preflight at
-		// exactly the moment failover happens. Operators who want 1M must
-		// pin agent.model to a known auto-1M model name explicitly.
-		{"auto on, tier medium → 200K (conservative)", true, 128000, "", "medium", 200_000},
-		{"auto on, tier big → 200K (conservative)", true, 128000, "", "big", 200_000},
-		{"auto on, tier small → 200K", true, 128000, "", "small", 200_000},
+		// Tier-only resolution defaults to the priority-1 happy-path window:
+		// medium/big/large → 1M (sonnet-4-6 / opus-4-6 1M auto), small → 200K
+		// (haiku has no 1M variant). Failover off priority 1 is caught by the
+		// reactive recovery layer (single 400 + summary cap + retry).
+		{"auto on, tier medium → 1M (sonnet-4-6 happy path)", true, 128000, "", "medium", 1_000_000},
+		{"auto on, tier big → 1M (opus 1M happy path)", true, 128000, "", "big", 1_000_000},
+		{"auto on, tier small → 200K (haiku cap)", true, 128000, "", "small", 200_000},
 		{"auto off → config wins", false, 128000, "claude-opus-4-7", "", 128000},
 		{"auto on, config 0 → resolved", true, 0, "claude-opus-4-7", "", 1_000_000},
 	}

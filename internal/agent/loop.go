@@ -37,11 +37,13 @@ import (
 // Precedence:
 //  1. auto=false → configValue (operator-pinned)
 //  2. auto=true + non-empty specificModel or modelTier → resolver result.
-//     specific-model path can return 1M for known auto-1M models;
-//     tier-only path returns the conservative 200K floor (see
-//     client.lookupModelTier docstring for why tier resolution cannot
-//     trust 1M when Cloud-side priority/failover lands on non-auto-1M
-//     models). Unknown specific model also returns 200K.
+//     specific-model path returns the exact cap (1M for auto-1M models,
+//     200K for sonnet-4-5/4/haiku-4-5, 200K for unknown).
+//     tier-only path returns the priority-1 happy-path window: medium/
+//     big/large → 1M, small → 200K. Cloud failover off priority 1 is
+//     handled by the reactive recovery layer (single 400 + summary cap
+//     + retry) rather than a conservative pre-cap; see
+//     client.lookupModelTier docstring for the trade-off rationale.
 //  3. auto=true + both empty + configValue > 0 → configValue
 //  4. auto=true + both empty + configValue == 0 → 200_000 (resolver default)
 func computeEffectiveContextWindow(auto bool, configValue int, specificModel, modelTier string) int {

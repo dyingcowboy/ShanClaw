@@ -24,21 +24,22 @@ func TestResolveModelCapabilities(t *testing.T) {
 		{"haiku-4-5", "claude-haiku-4-5", "", 200_000},
 		{"haiku-4-5 dated", "claude-haiku-4-5-20251001", "", 200_000},
 
-		// Tier-only resolution: every recognized tier returns the conservative
-		// 200K floor. Cloud's priority/failover chains don't guarantee that
-		// tier maps to a 1M-capable model (large priority 1 is gpt-5.1 at
-		// 400K; medium failover lands on sonnet-4-5 at 200K). Operators who
-		// need the 1M benefit must pin agent.model to a 1M-capable name.
-		// "large" is the Shannon Cloud nomenclature; "big" is ShanClaw's —
-		// both accepted to avoid surprises when conventions leak across.
-		{"big tier (conservative 200K)", "", "big", 200_000},
-		{"large tier (Cloud nomenclature)", "", "large", 200_000},
-		{"medium tier (conservative 200K)", "", "medium", 200_000},
-		{"small tier", "", "small", 200_000},
+		// Tier-only resolution: medium/big/large default to 1M (priority 1
+		// happy-path on Cloud is sonnet-4-6 1M auto for medium; opus-4-6 1M
+		// auto for large). small stays 200K because haiku-4-5 has no 1M
+		// variant and failover chain would 400 against haiku's actual cap.
+		// Failover from medium/large priority 1 is handled by the reactive
+		// recovery layer (single 400 + summary cap + retry).
+		// "large" is Shannon Cloud nomenclature, "big" is ShanClaw's — both
+		// accepted as aliases.
+		{"big tier (1M happy-path)", "", "big", 1_000_000},
+		{"large tier (Cloud nomenclature)", "", "large", 1_000_000},
+		{"medium tier (1M happy-path)", "", "medium", 1_000_000},
+		{"small tier (haiku 200K cap)", "", "small", 200_000},
 
-		// Specific takes precedence over tier (specific path is the only one
-		// that can return 1M, so a 200K model + big tier still resolves to 200K).
-		{"specific wins over tier", "claude-haiku-4-5", "big", 200_000},
+		// Specific takes precedence over tier — a known 200K-cap model still
+		// resolves to 200K even when paired with a 1M tier.
+		{"specific wins over tier (haiku + big)", "claude-haiku-4-5", "big", 200_000},
 
 		// Unknown / empty → conservative default.
 		{"empty both", "", "", 200_000},

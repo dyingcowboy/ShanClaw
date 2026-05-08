@@ -15,15 +15,14 @@ type ModelCapabilities struct {
 //
 // Precedence:
 //  1. specificModel matched against known prefixes → that model's window
-//     (only path that returns 1M; pin agent.model to opt in)
 //  2. specificModel set but unrecognized → conservative 200K (NOT a tier
 //     fallback, because mismatching tier on an unknown specific model
 //     would silently widen the cap and risk a 200K-cap model hitting the
 //     1M assumption — that's the failure mode this resolver exists to prevent)
-//  3. specificModel empty + modelTier matches a known tier → 200K
-//     (conservative; see lookupModelTier docstring for why tier-only
-//     resolution cannot trust 1M when Cloud-side priority/failover lands
-//     on non-auto-1M models)
+//  3. specificModel empty + modelTier matches a known tier → tier window
+//     (medium/big/large = 1M, small = 200K; see lookupModelTier for why
+//     this is the happy-path optimistic default with reactive recovery
+//     as the failover safety net)
 //  4. both empty / unknown tier → conservative 200K default
 //
 // Source of truth for these caps:
@@ -81,29 +80,39 @@ func lookupSpecificModel(model string) (ModelCapabilities, bool) {
 	return ModelCapabilities{}, false
 }
 
-// lookupModelTier returns the conservative window for tier-only resolution.
+// lookupModelTier maps a tier name to the optimistic happy-path window.
 //
 // Cloud's tier→model selection is priority + failover (Shannon
-// config/models.yaml model_tiers). The first model in the chain is not
-// always the largest-window one:
-//   - large:  gpt-5.1 priority 1 = 400K (NOT 1M); opus-4-6 (1M auto) is priority 2
-//   - medium: sonnet-4-6 priority 1 = 1M auto, but failover lands on
-//     sonnet-4-5 (200K) or gpt-5-mini (400K)
-//   - small:  haiku-4-5 priority 1 = 200K (matches)
+// config/models.yaml model_tiers). Priority 1 by tier:
+//   - small:  haiku-4-5 = 200K (matches; haiku has no 1M variant)
+//   - medium: sonnet-4-6 = 1M auto (Anthropic auto-1M since 2026-03-13)
+//   - large:  gpt-5.1 = 400K (priority 2 opus-4-6 is 1M auto)
 //
-// Speculating up to 1M would make preflight compaction inert exactly when
-// failover happens — the original failure mode this resolver exists to
-// prevent. Returning 200K conservatively across every tier is the safe
-// default. Operators who want the 1M benefit on capable models must pin
-// agent.model to a 1M-capable model name explicitly so lookupSpecificModel
-// resolves it (the only path that returns 1M).
+// Defaulting medium and large to 1M trades a rare failover penalty for
+// the common-case win: in production, priority 1 is hit > 95% of the
+// time, and the surrounding cascade has multiple defenses for the
+// failover branch (preflight at 0.95 catches estimate overshoot,
+// reactive recovery handles a 400 from the gateway with summary cap +
+// emergency compaction + retry — see internal/agent/loop.go and
+// internal/context/summarize.go). Speculating up to 1M when failover
+// lands on sonnet-4-5/gpt-5-mini costs at most one reactive cycle; the
+// alternative — capping every tier at 200K — would self-impose 800K of
+// headroom loss on every healthy turn (issue #109).
 //
-// Both "big" (ShanClaw nomenclature) and "large" (Shannon Cloud nomenclature)
-// are accepted to avoid surprises if Cloud-side conventions leak through.
+// small stays at 200K because haiku-4-5 has no 1M variant and the
+// failover chain (gpt-5-nano 400K, grok-fast 2M, gemini-flash-lite 1M)
+// would still 400 against haiku's actual cap when it returns. Operators
+// who want the 1M benefit on a known capable model can still pin
+// agent.model explicitly via lookupSpecificModel.
+//
+// Both "big" (ShanClaw nomenclature) and "large" (Shannon Cloud
+// nomenclature) are accepted; they are aliases.
 func lookupModelTier(tier string) (ModelCapabilities, bool) {
 	switch tier {
-	case "big", "large", "medium", "small":
+	case "small":
 		return ModelCapabilities{ContextWindow: 200_000}, true
+	case "medium", "big", "large":
+		return ModelCapabilities{ContextWindow: 1_000_000}, true
 	}
 	return ModelCapabilities{}, false
 }
