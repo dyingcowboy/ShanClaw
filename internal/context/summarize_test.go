@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -467,5 +468,48 @@ func TestGenerateSummary_CapsOversizedTranscript(t *testing.T) {
 			head = head[:200]
 		}
 		t.Errorf("expected truncation marker in capped transcript, got: %q...", head)
+	}
+}
+
+// TestCapTranscriptForSummarize_UTF8Safe verifies that head+tail truncation
+// of multi-byte content (Chinese here, but applies to any UTF-8) does not
+// split a rune mid-sequence. Without rune-boundary adjustment, json.Marshal
+// would replace the dangling bytes with U+FFFD before the summarizer sees
+// them. (See 2026-05-08 review Finding 3.)
+func TestCapTranscriptForSummarize_UTF8Safe(t *testing.T) {
+	// 7 bytes per "你好 " run; 200_000 runs ≈ 1.4M bytes — well over cap.
+	chinese := strings.Repeat("你好 ", 200_000)
+	if !utf8.ValidString(chinese) {
+		t.Fatalf("test setup invariant: input must be valid UTF-8")
+	}
+
+	out := capTranscriptForSummarize(chinese)
+	if !utf8.ValidString(out) {
+		t.Errorf("output is not valid UTF-8 — head/tail truncation split a rune. len=%d", len(out))
+	}
+	if len(out) > summarizeInputCapChars {
+		t.Errorf("output len = %d, want <= %d (cap)", len(out), summarizeInputCapChars)
+	}
+	if !strings.Contains(out, "transcript truncated") {
+		t.Errorf("expected truncation marker in capped output")
+	}
+}
+
+// TestCapTranscriptForSummarize_BoundaryAtCap verifies the cap is enforced
+// at the byte boundary (input == cap → no truncation; input == cap+1 →
+// truncation fires).
+func TestCapTranscriptForSummarize_BoundaryAtCap(t *testing.T) {
+	atCap := strings.Repeat("a", summarizeInputCapChars)
+	if got := capTranscriptForSummarize(atCap); got != atCap {
+		t.Errorf("input at cap was modified: in=%d out=%d", len(atCap), len(got))
+	}
+
+	overCap := strings.Repeat("a", summarizeInputCapChars+1)
+	got := capTranscriptForSummarize(overCap)
+	if got == overCap {
+		t.Errorf("input over cap was NOT truncated: len=%d", len(got))
+	}
+	if !strings.Contains(got, "transcript truncated") {
+		t.Errorf("over-cap input missing truncation marker")
 	}
 }

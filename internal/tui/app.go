@@ -435,6 +435,11 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		ac := agentOverride.Config.Agent
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
+			// Re-resolve effective window against override model
+			// (Finding 1, 2026-05-08).
+			if runtimeCfg.Agent.ContextWindowAuto {
+				loop.RefreshContextWindow(true, runtimeCfg.Agent.ContextWindow)
+			}
 		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
@@ -586,6 +591,11 @@ func (m *Model) rebuildAgentLoop() {
 		ac := m.agentOverride.Config.Agent
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
+			// Re-resolve effective window against override model
+			// (Finding 1, 2026-05-08).
+			if m.cfg.Agent.ContextWindowAuto {
+				loop.RefreshContextWindow(true, m.cfg.Agent.ContextWindow)
+			}
 		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
@@ -1930,7 +1940,16 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			msgCount = len(sess.Messages)
 			tokenEst = ctxwin.EstimateTokens(sess.Messages)
 		}
-		ctxWindow := m.cfg.Agent.ContextWindow
+		// Prefer the live loop's resolved window so /status reflects auto-1M
+		// + per-agent override re-resolution. Fall back to static config when
+		// no loop is active yet (first-render before any session starts).
+		var ctxWindow int
+		if m.agentLoop != nil {
+			ctxWindow = m.agentLoop.ContextWindow()
+		}
+		if ctxWindow <= 0 {
+			ctxWindow = m.cfg.Agent.ContextWindow
+		}
 		if ctxWindow <= 0 {
 			ctxWindow = 128000
 		}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -26,14 +27,44 @@ const summarizeInputCapChars = 540_000
 // capTranscriptForSummarize returns s unchanged if it fits, or a head+tail
 // concatenation otherwise. Truncation marker is human-readable so the
 // summarizer can note the gap in its analysis.
+//
+// Boundaries are adjusted to UTF-8 rune starts so multi-byte content
+// (Chinese, Japanese, emoji, …) is never truncated mid-rune. Without this,
+// a byte-aligned slice can leave a partial UTF-8 sequence at either end;
+// json.Marshal would then replace the dangling bytes with U+FFFD before
+// the summarizer ever sees them, polluting the input. Verified with a 1.4M
+// byte all-Chinese transcript producing 2 U+FFFD chars under the previous
+// impl. (See 2026-05-08 review Finding 3.)
 func capTranscriptForSummarize(s string) string {
 	if len(s) <= summarizeInputCapChars {
 		return s
 	}
-	half := summarizeInputCapChars/2 - 60 // 60 = len(marker) margin
-	return s[:half] +
-		"\n\n[... transcript truncated for size — middle elided ...]\n\n" +
-		s[len(s)-half:]
+	const marker = "\n\n[... transcript truncated for size — middle elided ...]\n\n"
+	// Reserve full marker length, then split the remainder evenly between
+	// head and tail. Worst-case output length = 2*half + len(marker) ≤ cap.
+	// (Boundary adjustments below only shrink head/tail further, so the
+	// inequality stays tight in the byte-aligned case and slack-by-up-to-3
+	// in the multi-byte case — never crosses the cap.)
+	half := (summarizeInputCapChars - len(marker)) / 2
+
+	// Adjust head boundary down to a rune start. utf8.RuneStart returns
+	// true at byte offsets that begin a UTF-8 codepoint; since we truncate
+	// the middle, walking *backwards* a few bytes at most cannot extend
+	// the head past the configured cap.
+	headEnd := half
+	for headEnd > 0 && !utf8.RuneStart(s[headEnd]) {
+		headEnd--
+	}
+
+	// Adjust tail boundary up to a rune start. Walking *forwards* keeps
+	// the result strictly within `half` bytes; combined with the head
+	// adjustment, total result length is ≤ summarizeInputCapChars.
+	tailStart := len(s) - half
+	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
+		tailStart++
+	}
+
+	return s[:headEnd] + marker + s[tailStart:]
 }
 
 const summarizePrompt = `Compress the following conversation into a concise summary using a two-phase approach.

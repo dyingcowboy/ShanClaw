@@ -12,8 +12,15 @@ type ModelCapabilities struct {
 }
 
 // ResolveModelCapabilities returns the API capabilities for a model.
-// specificModel takes precedence over modelTier. Unknown inputs return
-// the conservative 200K default — never speculate upward.
+//
+// Precedence:
+//  1. specificModel matched against known prefixes → that model's window
+//  2. specificModel set but unrecognized → conservative 200K (NOT a tier
+//     fallback, because mismatching tier on an unknown specific model
+//     would silently widen the cap and risk a 200K-cap model hitting the
+//     1M assumption — that's the failure mode this resolver exists to prevent)
+//  3. specificModel empty + modelTier matches a known tier → tier window
+//  4. both empty / unknown tier → conservative 200K default
 //
 // Source of truth for these caps:
 //   - 2026-03-13 release: 1M context GA for Opus 4.6 / Sonnet 4.6 (no header).
@@ -21,11 +28,18 @@ type ModelCapabilities struct {
 //   - 2026-04-30 release: context-1m-2025-08-07 beta retired for Sonnet 4.5/4
 //     (header now no-op).
 func ResolveModelCapabilities(specificModel, modelTier string) ModelCapabilities {
-	if cap, ok := lookupSpecificModel(specificModel); ok {
-		return cap
+	if specificModel != "" {
+		if caps, ok := lookupSpecificModel(specificModel); ok {
+			return caps
+		}
+		// Specific model named but not in our table — never speculate
+		// upward via tier fallback. Operator pinned a model we don't
+		// recognize; assume the conservative 200K cap so the agent loop
+		// triggers compaction at a safe boundary.
+		return ModelCapabilities{ContextWindow: 200_000}
 	}
-	if cap, ok := lookupModelTier(modelTier); ok {
-		return cap
+	if caps, ok := lookupModelTier(modelTier); ok {
+		return caps
 	}
 	return ModelCapabilities{ContextWindow: 200_000}
 }

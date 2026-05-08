@@ -1056,6 +1056,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		ac := agentOverride.Config.Agent
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
+			// Re-resolve effective window against override model. Without
+			// this an Opus 4.7 → Sonnet 4.5 override would keep the 1M
+			// assumption and trip the 200K cap. (Finding 1, 2026-05-08.)
+			if runCfg.Agent.ContextWindowAuto {
+				loop.RefreshContextWindow(true, runCfg.Agent.ContextWindow)
+			}
 		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
@@ -1081,6 +1087,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
 	if req.ModelOverride != "" {
 		loop.SetModelTier(req.ModelOverride)
+		// Cloud-side tier override (e.g. force "small" for heartbeat) also
+		// needs window recompute when auto-resolution is on. Per-agent
+		// ContextWindow override above already won via SetContextWindow,
+		// so this only kicks in when no operator pin is set.
+		if runCfg.Agent.ContextWindowAuto && (agentOverride == nil ||
+			agentOverride.Config == nil || agentOverride.Config.Agent == nil ||
+			agentOverride.Config.Agent.ContextWindow == nil) {
+			loop.RefreshContextWindow(true, runCfg.Agent.ContextWindow)
+		}
 	}
 	// Inject session metadata as sticky context so it survives compaction.
 	{

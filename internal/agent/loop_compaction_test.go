@@ -1700,3 +1700,74 @@ func TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript(t *testing
 			peakSummaryChars, summarizeInputCapCharsLocal/2)
 	}
 }
+
+// TestRefreshContextWindow_RecalculatesAfterModelChange verifies the override
+// path that the 2026-05-08 review's Finding 1 caught: when an agent override
+// or req.ModelOverride flips the active model after initial window resolution,
+// loop.RefreshContextWindow must re-route the auto-resolution through the new
+// (specific, tier) pair instead of leaving the old window in place.
+func TestRefreshContextWindow_RecalculatesAfterModelChange(t *testing.T) {
+	cases := []struct {
+		name          string
+		initialModel  string
+		initialTier   string
+		override      func(loop *AgentLoop)
+		auto          bool
+		configValue   int
+		wantWindow    int
+	}{
+		{
+			name:         "Opus 4.7 → Sonnet 4.5 (1M → 200K)",
+			initialModel: "claude-opus-4-7",
+			initialTier:  "medium",
+			override:     func(l *AgentLoop) { l.SetSpecificModel("claude-sonnet-4-5") },
+			auto:         true,
+			configValue:  128_000,
+			wantWindow:   200_000,
+		},
+		{
+			name:         "tier flip medium → small",
+			initialModel: "",
+			initialTier:  "medium",
+			override:     func(l *AgentLoop) { l.SetModelTier("small") },
+			auto:         true,
+			configValue:  128_000,
+			wantWindow:   200_000,
+		},
+		{
+			name:         "auto=false → Refresh is a no-op (caller responsibility)",
+			initialModel: "claude-opus-4-7",
+			initialTier:  "medium",
+			override:     func(l *AgentLoop) { l.SetSpecificModel("claude-haiku-4-5") },
+			auto:         false,
+			configValue:  128_000,
+			wantWindow:   128_000, // honors static config
+		},
+		{
+			name:         "unknown override model + medium tier → 200K (Finding 2 interaction)",
+			initialModel: "claude-opus-4-7",
+			initialTier:  "medium",
+			override:     func(l *AgentLoop) { l.SetSpecificModel("claude-flux-9000") },
+			auto:         true,
+			configValue:  128_000,
+			wantWindow:   200_000, // unknown specific must NOT fall back to medium=1M
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			loop := &AgentLoop{
+				modelTier:     tc.initialTier,
+				specificModel: tc.initialModel,
+			}
+			loop.contextWindow = ComputeEffectiveContextWindow(tc.auto, tc.configValue, tc.initialModel, tc.initialTier)
+			tc.override(loop)
+			got := loop.RefreshContextWindow(tc.auto, tc.configValue)
+			if got != tc.wantWindow {
+				t.Errorf("after override: contextWindow = %d, want %d", got, tc.wantWindow)
+			}
+			if loop.contextWindow != tc.wantWindow {
+				t.Errorf("a.contextWindow = %d, want %d", loop.contextWindow, tc.wantWindow)
+			}
+		})
+	}
+}

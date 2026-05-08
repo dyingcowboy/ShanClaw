@@ -36,6 +36,17 @@ func TestResolveModelCapabilities(t *testing.T) {
 		{"empty both", "", "", 200_000},
 		{"unknown tier", "", "huge", 200_000},
 		{"future model", "claude-opus-5-0", "", 200_000},
+
+		// Regression: specific model that lookupSpecificModel does not
+		// recognize must NOT fall back to tier. Operator pinned a model
+		// we don't know; conservative 200K is the safe default. (See
+		// 2026-05-08 review Finding 2 — earlier impl returned 1M here
+		// via the tier fallback, defeating the resolver on operator
+		// pins of newly-released models that hadn't been added to the
+		// prefix table.)
+		{"unknown specific + medium tier", "claude-flux-9000", "medium", 200_000},
+		{"unknown specific + big tier", "claude-future-1-0", "big", 200_000},
+		{"unknown specific + small tier", "claude-future-1-0", "small", 200_000},
 	}
 
 	for _, tc := range cases {

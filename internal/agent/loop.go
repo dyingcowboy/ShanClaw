@@ -722,6 +722,36 @@ func (a *AgentLoop) SetModelTier(tier string) {
 	a.modelTier = tier
 }
 
+// ContextWindow returns the loop's currently-resolved effective context
+// window. Display surfaces (TUI /status, audit metadata, telemetry) should
+// prefer this over the static config value because it reflects model-aware
+// auto-resolution and any per-agent / req.ModelOverride re-resolution.
+func (a *AgentLoop) ContextWindow() int {
+	return a.contextWindow
+}
+
+// RefreshContextWindow re-resolves the effective context window using the
+// loop's *current* specificModel + modelTier and updates a.contextWindow.
+//
+// Callers must invoke this after any SetSpecificModel / SetModelTier change
+// when context_window_auto is true, otherwise the loop keeps the window it
+// was constructed with — which silently breaks the auto-1M guarantee on
+// per-agent / per-request model overrides:
+//
+//	loop.SetContextWindow(big)            // initial resolve assumed 1M model
+//	loop.SetSpecificModel("haiku-4-5")    // override to 200K cap
+//	// without RefreshContextWindow: loop still thinks it has 1M, preflight
+//	// waits until 950K, the API returns 400 at 200K. This is the same bug
+//	// shape that issue #117 was filed against, recurring on the override
+//	// path. (See 2026-05-08 review Finding 1.)
+//
+// Returns the new contextWindow value so callers can log / audit the
+// resolution if they need to.
+func (a *AgentLoop) RefreshContextWindow(auto bool, configValue int) int {
+	a.contextWindow = ComputeEffectiveContextWindow(auto, configValue, a.specificModel, a.modelTier)
+	return a.contextWindow
+}
+
 func (a *AgentLoop) SetMCPContext(ctx string) {
 	a.mcpContext = ctx
 }

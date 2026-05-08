@@ -237,6 +237,13 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		ac := agentOverride.Config.Agent
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
+			// Re-resolve the effective window against the override model;
+			// without this, an Opus 4.7 → Haiku 4.5 override would keep
+			// the loop's 1M window assumption and trip the 200K API cap.
+			// (Finding 1 in the 2026-05-08 review.)
+			if runCfg.Agent.ContextWindowAuto {
+				loop.RefreshContextWindow(true, runCfg.Agent.ContextWindow)
+			}
 		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
