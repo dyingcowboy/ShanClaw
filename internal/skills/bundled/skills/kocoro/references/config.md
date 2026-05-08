@@ -41,6 +41,8 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `agent.model` | Default model for all agents (e.g., `claude-sonnet-4-5`) | No |
 | `agent.temperature` | Creativity level 0.0–1.0. Lower = more predictable. | No |
 | `agent.max_iterations` | Max tool-use rounds per conversation turn | No |
+| `agent.context_window` | Static context window size in tokens. Used as fallback when `context_window_auto` is `false` or the model is unknown (default: 128000). | No |
+| `agent.context_window_auto` | When `true` (default), resolve the active model's true context window — 1,000,000 for Opus 4.6/4.7 and Sonnet 4.6 (auto-1M, no header required since 2026-03-13), 200,000 for Sonnet 4.5/4 and Haiku 4.5. When `false`, honor the static `agent.context_window`. Per-agent overrides take precedence over both. | No |
 | `agent.skill_discovery` | Enable small-model skill matching on first turn (default: true) | No |
 | `agent.time_based_compact.enabled` | Master switch for time-gated tool_result clearing (default: false) | No |
 | `agent.time_based_compact.gap_threshold_minutes` | Fire when (now − last assistant response) exceeds this; matches the Anthropic 1h cache TTL ceiling so no extra cache miss is forced (default: 60) | No |
