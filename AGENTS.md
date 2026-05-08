@@ -83,7 +83,7 @@ internal/
   instructions/
     loader.go          # instructions, memory, custom commands
   tools/
-    register.go        # local + MCP + gateway tool registration; RegisterPublishTool, RegisterGenerateImageTool
+    register.go        # local + MCP + gateway tool registration; RegisterPublishTool, RegisterGenerateImageTool, RegisterEditImageTool
     schedule.go        # schedule_create/list/update/remove tools
     session_search.go  # session_search tool
     mcp_tool.go        # MCPTool adapter
