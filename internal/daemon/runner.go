@@ -1008,7 +1008,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
-	loop.SetContextWindow(runCfg.Agent.ContextWindow)
+	effectiveWindow := agent.ComputeEffectiveContextWindow(
+		runCfg.Agent.ContextWindowAuto,
+		runCfg.Agent.ContextWindow,
+		runCfg.Agent.Model,
+		runCfg.ModelTier,
+	)
+	loop.SetContextWindow(effectiveWindow)
 	loop.SetEnableStreaming(false)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	loop.SetCacheSource(cacheSourceFromDaemonSource(req.Source))

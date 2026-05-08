@@ -52,15 +52,16 @@ type MCPConfig struct {
 }
 
 type AgentConfig struct {
-	MaxIterations   int     `mapstructure:"max_iterations"   yaml:"max_iterations"   json:"max_iterations"`
-	Temperature     float64 `mapstructure:"temperature"      yaml:"temperature"      json:"temperature"`
-	MaxTokens       int     `mapstructure:"max_tokens"       yaml:"max_tokens"       json:"max_tokens"`
-	Thinking        bool    `mapstructure:"thinking"         yaml:"thinking"         json:"thinking"`
-	ThinkingMode    string  `mapstructure:"thinking_mode"    yaml:"thinking_mode"    json:"thinking_mode"` // "adaptive" (default) or "enabled" (fixed budget)
-	ThinkingBudget  int     `mapstructure:"thinking_budget"  yaml:"thinking_budget"  json:"thinking_budget"`
-	ReasoningEffort string  `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
-	Model           string  `mapstructure:"model"            yaml:"model"            json:"model"`          // specific model override
-	ContextWindow   int     `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
+	MaxIterations     int     `mapstructure:"max_iterations"   yaml:"max_iterations"   json:"max_iterations"`
+	Temperature       float64 `mapstructure:"temperature"      yaml:"temperature"      json:"temperature"`
+	MaxTokens         int     `mapstructure:"max_tokens"       yaml:"max_tokens"       json:"max_tokens"`
+	Thinking          bool    `mapstructure:"thinking"         yaml:"thinking"         json:"thinking"`
+	ThinkingMode      string  `mapstructure:"thinking_mode"    yaml:"thinking_mode"    json:"thinking_mode"` // "adaptive" (default) or "enabled" (fixed budget)
+	ThinkingBudget    int     `mapstructure:"thinking_budget"  yaml:"thinking_budget"  json:"thinking_budget"`
+	ReasoningEffort   string  `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
+	Model             string  `mapstructure:"model"            yaml:"model"            json:"model"`                     // specific model override
+	ContextWindow     int     `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"`            // model context window in tokens
+	ContextWindowAuto bool    `mapstructure:"context_window_auto" yaml:"context_window_auto" json:"context_window_auto"` // resolve from model when true; honor static ContextWindow when false
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an
 	// LLM response). Other phases (tool execution, approval wait, compaction
@@ -205,6 +206,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.reasoning_effort", "")
 	viper.SetDefault("agent.model", "")
 	viper.SetDefault("agent.context_window", 128000)
+	viper.SetDefault("agent.context_window_auto", true)
 	viper.SetDefault("agent.idle_soft_timeout_secs", 90)
 	viper.SetDefault("agent.idle_hard_timeout_secs", 0) // 0 = disabled; flip to <600 after dogfood
 	// Time-based microcompact. Disabled by default — short sessions never
@@ -460,15 +462,16 @@ type overlayMemoryConfig struct {
 }
 
 type overlayAgentConfig struct {
-	MaxIterations   *int     `yaml:"max_iterations"`
-	Temperature     *float64 `yaml:"temperature"`
-	MaxTokens       *int     `yaml:"max_tokens"`
-	Thinking        *bool    `yaml:"thinking"`
-	ThinkingMode    *string  `yaml:"thinking_mode"`
-	ThinkingBudget  *int     `yaml:"thinking_budget"`
-	ReasoningEffort *string  `yaml:"reasoning_effort"`
-	Model           *string  `yaml:"model"`
-	ContextWindow   *int     `yaml:"context_window"`
+	MaxIterations     *int     `yaml:"max_iterations"`
+	Temperature       *float64 `yaml:"temperature"`
+	MaxTokens         *int     `yaml:"max_tokens"`
+	Thinking          *bool    `yaml:"thinking"`
+	ThinkingMode      *string  `yaml:"thinking_mode"`
+	ThinkingBudget    *int     `yaml:"thinking_budget"`
+	ReasoningEffort   *string  `yaml:"reasoning_effort"`
+	Model             *string  `yaml:"model"`
+	ContextWindow     *int     `yaml:"context_window"`
+	ContextWindowAuto *bool    `yaml:"context_window_auto"`
 
 	IdleSoftTimeoutSecs *int  `yaml:"idle_soft_timeout_secs"`
 	IdleHardTimeoutSecs *int  `yaml:"idle_hard_timeout_secs"`
@@ -508,6 +511,7 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.reasoning_effort":       {Level: "default"},
 		"agent.model":                  {Level: "default"},
 		"agent.context_window":         {Level: "default"},
+		"agent.context_window_auto":    {Level: "default"},
 		"agent.idle_soft_timeout_secs": {Level: "default"},
 		"agent.idle_hard_timeout_secs": {Level: "default"},
 		"tools.bash_timeout":           {Level: "default"},
@@ -561,6 +565,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.context_window") {
 		cfg.Sources["agent.context_window"] = src
+	}
+	if viper.IsSet("agent.context_window_auto") {
+		cfg.Sources["agent.context_window_auto"] = src
 	}
 	if viper.IsSet("agent.idle_soft_timeout_secs") {
 		cfg.Sources["agent.idle_soft_timeout_secs"] = src
@@ -682,6 +689,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Agent.ContextWindow != nil {
 			cfg.Agent.ContextWindow = *overlay.Agent.ContextWindow
 			cfg.Sources["agent.context_window"] = src
+		}
+		if overlay.Agent.ContextWindowAuto != nil {
+			cfg.Agent.ContextWindowAuto = *overlay.Agent.ContextWindowAuto
+			cfg.Sources["agent.context_window_auto"] = src
 		}
 		if overlay.Agent.IdleSoftTimeoutSecs != nil {
 			cfg.Agent.IdleSoftTimeoutSecs = *overlay.Agent.IdleSoftTimeoutSecs

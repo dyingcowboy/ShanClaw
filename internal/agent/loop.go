@@ -30,6 +30,36 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
+// computeEffectiveContextWindow resolves the model's context window when
+// agent.context_window_auto is true. Falls back to the static config value
+// when auto is off or the model is unknown.
+//
+// Precedence:
+//  1. auto=false → configValue (operator-pinned)
+//  2. auto=true + non-empty specificModel or modelTier → resolver result
+//     (1M for known auto-1M models, 200K floor for unknown — never speculate up)
+//  3. auto=true + both empty + configValue > 0 → configValue
+//  4. auto=true + both empty + configValue == 0 → 200_000 (resolver default)
+func computeEffectiveContextWindow(auto bool, configValue int, specificModel, modelTier string) int {
+	if !auto {
+		return configValue
+	}
+	caps := client.ResolveModelCapabilities(specificModel, modelTier)
+	if specificModel != "" || modelTier != "" {
+		return caps.ContextWindow
+	}
+	if configValue > 0 {
+		return configValue
+	}
+	return caps.ContextWindow
+}
+
+// ComputeEffectiveContextWindow is the package-public form of
+// computeEffectiveContextWindow, exposed for daemon wiring.
+func ComputeEffectiveContextWindow(auto bool, configValue int, specificModel, modelTier string) int {
+	return computeEffectiveContextWindow(auto, configValue, specificModel, modelTier)
+}
+
 // buildSkillListing formats a <system-reminder> with skill descriptions
 // for injection as a user message. Uses rune-safe truncation with a total
 // character budget.

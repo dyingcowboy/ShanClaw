@@ -1308,3 +1308,31 @@ func TestAgentLoop_EmptySummaryTriggersBackoff(t *testing.T) {
 	// breaker held for the entire remaining run — that is also a valid
 	// GREEN state and intentionally passes without additional checks.
 }
+
+func TestEffectiveContextWindow_AutoFromModel(t *testing.T) {
+	cases := []struct {
+		name          string
+		auto          bool
+		configValue   int
+		specificModel string
+		modelTier     string
+		want          int
+	}{
+		{"auto on, opus 4.7 → 1M", true, 128000, "claude-opus-4-7", "", 1_000_000},
+		{"auto on, sonnet 4.6 → 1M", true, 128000, "claude-sonnet-4-6", "", 1_000_000},
+		{"auto on, haiku 4.5 → 200K", true, 128000, "claude-haiku-4-5", "", 200_000},
+		{"auto on, unknown → config value", true, 128000, "", "", 128000},
+		{"auto on, tier medium → 1M", true, 128000, "", "medium", 1_000_000},
+		{"auto off → config wins", false, 128000, "claude-opus-4-7", "", 128000},
+		{"auto on, config 0 → resolved", true, 0, "claude-opus-4-7", "", 1_000_000},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeEffectiveContextWindow(tc.auto, tc.configValue, tc.specificModel, tc.modelTier)
+			if got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
