@@ -19,6 +19,29 @@ func TestLookupModelContextWindow(t *testing.T) {
 		{"sonnet 4 deprecated 200K", "claude-sonnet-4-20250514", 200_000, true},
 		{"future dated sonnet 4.6 via prefix", "claude-sonnet-4-6-20260301", 1_000_000, true},
 		{"future dated opus 4.7 via prefix", "claude-opus-4-7-20260601", 1_000_000, true},
+		// 200K prefix coverage — guards against the "cloud failover from
+		// sonnet-4-6 (1M) to a dateless/future-dated 200K model leaves
+		// the loop at 1M and 400s on next prompt" failure mode that
+		// PR review item #3 caught.
+		{"dateless sonnet 4.5 via prefix", "claude-sonnet-4-5", 200_000, true},
+		{"dateless haiku 4.5 via prefix", "claude-haiku-4-5", 200_000, true},
+		{"dateless opus 4.5 via prefix", "claude-opus-4-5", 200_000, true},
+		{"dateless opus 4.1 via prefix", "claude-opus-4-1", 200_000, true},
+		{"future dated haiku 4.5 via prefix", "claude-haiku-4-5-20260601", 200_000, true},
+		{"future dated sonnet 4.5 via prefix", "claude-sonnet-4-5-20260101", 200_000, true},
+		// Hypothetical future "claude-sonnet-4-NN" models with no specific
+		// prefix entry must NOT silently down-cap to 200K — we don't know
+		// their actual cap, so (0,false) → caller keeps existing window
+		// is the safer default. (Mirror of the "numeric suffix is NOT a
+		// dated variant" guard for the 200K side.)
+		{"unknown sonnet 4 sibling", "claude-sonnet-4-anyfuture", 0, false},
+		// Longest-prefix-first invariant: with multiple matching prefixes
+		// (e.g. if we later added a broader fallback), the longest one
+		// must win. claude-sonnet-4-6-20270101 must match the 1M family
+		// prefix, never a hypothetical broader 200K prefix. (PR review
+		// item #3 — current table has no such overlap, but the assertion
+		// guards future additions.)
+		{"longest-prefix-first guards future overlap", "claude-sonnet-4-6-20270101", 1_000_000, true},
 		{"gpt-5.1 400K", "gpt-5.1", 400_000, true},
 		{"gpt-4.1 dated 128K", "gpt-4.1-2025-04-14", 128_000, true},
 		{"gemini 2.5 pro 1M+", "gemini-2.5-pro", 1_048_576, true},
