@@ -518,6 +518,10 @@ func (a *AgentLoop) reportLLMUsage(u client.Usage, model string) {
 //   - Model is unknown to LookupModelContextWindow (graceful degradation —
 //     leaves existing value untouched).
 //   - Looked-up value matches current contextWindow (no churn).
+//
+// On a real change, emits OnRunStatus("context_window_autodetect", ...) so
+// SSE/Desktop subscribers and audit can correlate compaction-threshold
+// shifts with the model that triggered them.
 func (a *AgentLoop) maybeAutoAdjustContextWindow(model string) {
 	if a.contextWindowExplicit || model == "" {
 		return
@@ -526,7 +530,15 @@ func (a *AgentLoop) maybeAutoAdjustContextWindow(model string) {
 	if !ok || cw == a.contextWindow {
 		return
 	}
+	prev := a.contextWindow
 	a.contextWindow = cw
+	log.Printf("agent: context_window auto-detect model=%s %d -> %d", model, prev, cw)
+	if rs, ok := a.handler.(RunStatusHandler); ok {
+		rs.OnRunStatus(
+			"context_window_autodetect",
+			fmt.Sprintf("model=%s prev_tokens=%d new_tokens=%d", model, prev, cw),
+		)
+	}
 }
 
 type EventHandler interface {
@@ -851,19 +863,21 @@ func (a *AgentLoop) SetSpecificModel(model string) {
 	a.specificModel = model
 }
 
-// SetContextWindow seeds the context window without locking it. Auto-detect
-// from the observed model in cloud responses can still update the value
-// later. Used at construction time when the user did not explicitly set
-// agent.context_window in config (i.e. value comes from viper default).
+// SetContextWindow seeds the context window from a hint (typically the
+// global agent.context_window config value). The seed is used for the
+// first turn; auto-detect from the model field in cloud responses
+// overrides it from turn 2 onward (see maybeAutoAdjustContextWindow).
 func (a *AgentLoop) SetContextWindow(tokens int) {
 	a.contextWindow = tokens
 }
 
 // SetContextWindowExplicit sets the context window AND locks it against
-// auto-detection. Used when the user explicitly configured
-// agent.context_window in config.yaml (project/local/global) or set a
-// per-agent context_window override. The lock ensures auto-detect from
-// observed model never overrides the user's intent.
+// auto-detection. Reserved for per-agent overrides
+// (~/.shannon/agents/<name>/config.yaml: context_window) where the user
+// has unambiguously expressed intent for this specific agent — auto-detect
+// would override that intent. Global config never reaches this path
+// (would surprise users who set a small cap for cost control by silently
+// raising it on long-context models).
 func (a *AgentLoop) SetContextWindowExplicit(tokens int) {
 	a.contextWindow = tokens
 	a.contextWindowExplicit = true

@@ -402,11 +402,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop := agent.NewAgentLoop(llmClient, reg, runtimeCfg.ModelTier, shannonDir, runtimeCfg.Agent.MaxIterations, runtimeCfg.Tools.ResultTruncation, runtimeCfg.Tools.ArgsTruncation, &runtimeCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runtimeCfg.Agent.MaxTokens)
 	loop.SetTemperature(runtimeCfg.Agent.Temperature)
-	if runtimeCfg.Sources["agent.context_window"].Level != "default" {
-		loop.SetContextWindowExplicit(runtimeCfg.Agent.ContextWindow)
-	} else {
-		loop.SetContextWindow(runtimeCfg.Agent.ContextWindow)
-	}
+	loop.SetContextWindow(runtimeCfg.Agent.ContextWindow)
 	// Interactive TUI — long-lived session with iteration, 1h cache pays off.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(runtimeCfg.Agent.SkillDiscoveryEnabled())
@@ -556,11 +552,7 @@ func (m *Model) rebuildAgentLoop() {
 	loop := agent.NewAgentLoop(m.llmClient, m.toolRegistry, m.cfg.ModelTier, m.shannonDir, m.cfg.Agent.MaxIterations, m.cfg.Tools.ResultTruncation, m.cfg.Tools.ArgsTruncation, &m.cfg.Permissions, m.auditor, m.hookRunner)
 	loop.SetMaxTokens(m.cfg.Agent.MaxTokens)
 	loop.SetTemperature(m.cfg.Agent.Temperature)
-	if m.cfg.Sources["agent.context_window"].Level != "default" {
-		loop.SetContextWindowExplicit(m.cfg.Agent.ContextWindow)
-	} else {
-		loop.SetContextWindow(m.cfg.Agent.ContextWindow)
-	}
+	loop.SetContextWindow(m.cfg.Agent.ContextWindow)
 	// Interactive TUI (switched agent) — same routing as the primary loop.
 	loop.SetCacheSource("tui")
 	if m.cfg.Agent.Model != "" {
