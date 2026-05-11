@@ -402,15 +402,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop := agent.NewAgentLoop(llmClient, reg, runtimeCfg.ModelTier, shannonDir, runtimeCfg.Agent.MaxIterations, runtimeCfg.Tools.ResultTruncation, runtimeCfg.Tools.ArgsTruncation, &runtimeCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runtimeCfg.Agent.MaxTokens)
 	loop.SetTemperature(runtimeCfg.Agent.Temperature)
-	// Ollama provider forces auto off — see Finding 1, 2026-05-08 review.
-	effectiveAuto := agent.EffectiveContextWindowAuto(runtimeCfg.Agent.ContextWindowAuto, runtimeCfg.Provider)
-	effectiveWindow := agent.ComputeEffectiveContextWindow(
-		effectiveAuto,
-		runtimeCfg.Agent.ContextWindow,
-		runtimeCfg.Agent.Model,
-		runtimeCfg.ModelTier,
-	)
-	loop.SetContextWindow(effectiveWindow)
+	loop.SetContextWindow(runtimeCfg.Agent.ContextWindow)
 	// Interactive TUI — long-lived session with iteration, 1h cache pays off.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(runtimeCfg.Agent.SkillDiscoveryEnabled())
@@ -437,11 +429,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		ac := agentOverride.Config.Agent
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
-			// Re-resolve effective window against override model
-			// (Finding 1, 2026-05-08).
-			if effectiveAuto {
-				loop.RefreshContextWindow(true, runtimeCfg.Agent.ContextWindow)
-			}
 		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
@@ -565,15 +552,7 @@ func (m *Model) rebuildAgentLoop() {
 	loop := agent.NewAgentLoop(m.llmClient, m.toolRegistry, m.cfg.ModelTier, m.shannonDir, m.cfg.Agent.MaxIterations, m.cfg.Tools.ResultTruncation, m.cfg.Tools.ArgsTruncation, &m.cfg.Permissions, m.auditor, m.hookRunner)
 	loop.SetMaxTokens(m.cfg.Agent.MaxTokens)
 	loop.SetTemperature(m.cfg.Agent.Temperature)
-	// Ollama provider forces auto off — see Finding 1, 2026-05-08 review.
-	effectiveAuto := agent.EffectiveContextWindowAuto(m.cfg.Agent.ContextWindowAuto, m.cfg.Provider)
-	effectiveWindow := agent.ComputeEffectiveContextWindow(
-		effectiveAuto,
-		m.cfg.Agent.ContextWindow,
-		m.cfg.Agent.Model,
-		m.cfg.ModelTier,
-	)
-	loop.SetContextWindow(effectiveWindow)
+	loop.SetContextWindow(m.cfg.Agent.ContextWindow)
 	// Interactive TUI (switched agent) — same routing as the primary loop.
 	loop.SetCacheSource("tui")
 	if m.cfg.Agent.Model != "" {
@@ -595,11 +574,6 @@ func (m *Model) rebuildAgentLoop() {
 		ac := m.agentOverride.Config.Agent
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
-			// Re-resolve effective window against override model
-			// (Finding 1, 2026-05-08).
-			if effectiveAuto {
-				loop.RefreshContextWindow(true, m.cfg.Agent.ContextWindow)
-			}
 		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
@@ -1816,12 +1790,6 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 					m.baseCfg.Ollama.Model = newModel
 				}
 				m.agentLoop.SetSpecificModel(newModel)
-				// No RefreshContextWindow here: Ollama provider keeps
-				// auto off (EffectiveContextWindowAuto returns false),
-				// so the loop's window stays pinned to the static
-				// agent.context_window the operator configured for the
-				// local model. The Anthropic prefix table can't map
-				// "qwen3:8b" etc. to a sensible value anyway.
 				saveCfg := m.cfg
 				if m.baseCfg != nil {
 					saveCfg = m.baseCfg
@@ -1866,15 +1834,6 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				}
 				m.cfg.ModelTier = parts[1]
 				m.agentLoop.SetModelTier(parts[1])
-				// Refresh the loop's context window so a tier flip
-				// (e.g. medium → small) actually narrows the preflight
-				// threshold. Without this, /model small kept the loop's
-				// 1M assumption and the preflight guard never fired —
-				// the same bug shape RefreshContextWindow exists to
-				// prevent. (Finding 2, 2026-05-08 review double-check.)
-				if agent.EffectiveContextWindowAuto(m.cfg.Agent.ContextWindowAuto, m.cfg.Provider) {
-					m.agentLoop.RefreshContextWindow(true, m.cfg.Agent.ContextWindow)
-				}
 				if err := config.Save(saveCfg); err != nil {
 					m.appendOutput(fmt.Sprintf("Model tier: %s (failed to save: %v)", parts[1], err))
 				} else {
@@ -1959,18 +1918,9 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			msgCount = len(sess.Messages)
 			tokenEst = ctxwin.EstimateTokens(sess.Messages)
 		}
-		// Prefer the live loop's resolved window so /status reflects auto-1M
-		// + per-agent override re-resolution. Fall back to static config when
-		// no loop is active yet (first-render before any session starts).
-		var ctxWindow int
-		if m.agentLoop != nil {
-			ctxWindow = m.agentLoop.ContextWindow()
-		}
+		ctxWindow := m.cfg.Agent.ContextWindow
 		if ctxWindow <= 0 {
-			ctxWindow = m.cfg.Agent.ContextWindow
-		}
-		if ctxWindow <= 0 {
-			ctxWindow = 128000
+			ctxWindow = 200000
 		}
 		pct := float64(tokenEst) / float64(ctxWindow) * 100
 		toolCount := 0

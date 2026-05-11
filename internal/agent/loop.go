@@ -30,67 +30,6 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
-// computeEffectiveContextWindow resolves the model's context window when
-// agent.context_window_auto is true. Falls back to the static config value
-// when auto is off or the model is unknown.
-//
-// Precedence:
-//  1. auto=false → configValue (operator-pinned)
-//  2. auto=true + non-empty specificModel or modelTier → resolver result.
-//     specific-model path returns the exact cap (1M for auto-1M models,
-//     200K for sonnet-4-5/4/haiku-4-5, 200K for unknown).
-//     tier-only path returns the priority-1 happy-path window: medium/
-//     big/large → 1M, small → 200K. Cloud failover off priority 1 is
-//     handled by the reactive recovery layer (single 400 + summary cap
-//     + retry) rather than a conservative pre-cap; see
-//     client.lookupModelTier docstring for the trade-off rationale.
-//  3. auto=true + both empty + configValue > 0 → configValue
-//  4. auto=true + both empty + configValue == 0 → 200_000 (resolver default)
-func computeEffectiveContextWindow(auto bool, configValue int, specificModel, modelTier string) int {
-	if !auto {
-		return configValue
-	}
-	caps := client.ResolveModelCapabilities(specificModel, modelTier)
-	if specificModel != "" || modelTier != "" {
-		return caps.ContextWindow
-	}
-	if configValue > 0 {
-		return configValue
-	}
-	return caps.ContextWindow
-}
-
-// ComputeEffectiveContextWindow is the package-public form of
-// computeEffectiveContextWindow, exposed for daemon wiring.
-func ComputeEffectiveContextWindow(auto bool, configValue int, specificModel, modelTier string) int {
-	return computeEffectiveContextWindow(auto, configValue, specificModel, modelTier)
-}
-
-// EffectiveContextWindowAuto returns whether auto-resolution should be
-// applied for this provider. Auto resolution maps tier/specific model to
-// a Claude-family context window via client.ResolveModelCapabilities —
-// that table is meaningless for the Ollama provider:
-//
-//   - Ollama model names like "qwen3:8b" or "llama3.1:70b" never match
-//     the Anthropic prefix table, so specific-model lookup falls through
-//     to the unknown-model 200K default — already wrong for "qwen3:32b"
-//     (32K) and right by accident for "llama3.1:8b" (128K).
-//   - Tier-only fallback (medium/big → 200K conservatively) still ignores
-//     the actual local-model window, which can be as small as 8K
-//     (llama-guard-4:12b) or 32K (qwen3 family).
-//
-// The right call for Ollama is to honor the operator's static
-// agent.context_window: they know which local model they're running and
-// what window it holds. This helper centralizes that policy so every
-// wiring site (cmd/root.go, daemon/runner.go, tui/app.go) makes the same
-// call. (See 2026-05-08 review Finding 1.)
-func EffectiveContextWindowAuto(auto bool, provider string) bool {
-	if provider == "ollama" {
-		return false
-	}
-	return auto
-}
-
 // preflightCompactThreshold is the fraction of the context window above
 // which a pre-flight compaction is forced before the next LLM call.
 // 0.95 leaves a 5% safety margin over EstimateTokens' chars/3.5 heuristic
@@ -751,36 +690,6 @@ func (a *AgentLoop) SetIdleTimeouts(softSecs, hardSecs int) {
 
 func (a *AgentLoop) SetModelTier(tier string) {
 	a.modelTier = tier
-}
-
-// ContextWindow returns the loop's currently-resolved effective context
-// window. Display surfaces (TUI /status, audit metadata, telemetry) should
-// prefer this over the static config value because it reflects model-aware
-// auto-resolution and any per-agent / req.ModelOverride re-resolution.
-func (a *AgentLoop) ContextWindow() int {
-	return a.contextWindow
-}
-
-// RefreshContextWindow re-resolves the effective context window using the
-// loop's *current* specificModel + modelTier and updates a.contextWindow.
-//
-// Callers must invoke this after any SetSpecificModel / SetModelTier change
-// when context_window_auto is true, otherwise the loop keeps the window it
-// was constructed with — which silently breaks the auto-1M guarantee on
-// per-agent / per-request model overrides:
-//
-//	loop.SetContextWindow(big)            // initial resolve assumed 1M model
-//	loop.SetSpecificModel("haiku-4-5")    // override to 200K cap
-//	// without RefreshContextWindow: loop still thinks it has 1M, preflight
-//	// waits until 950K, the API returns 400 at 200K. This is the same bug
-//	// shape that issue #117 was filed against, recurring on the override
-//	// path. (See 2026-05-08 review Finding 1.)
-//
-// Returns the new contextWindow value so callers can log / audit the
-// resolution if they need to.
-func (a *AgentLoop) RefreshContextWindow(auto bool, configValue int) int {
-	a.contextWindow = ComputeEffectiveContextWindow(auto, configValue, a.specificModel, a.modelTier)
-	return a.contextWindow
 }
 
 func (a *AgentLoop) SetMCPContext(ctx string) {
